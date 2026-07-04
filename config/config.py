@@ -1,4 +1,6 @@
 # Global configuration
+import copy
+import json
 
 SPLIT_CONFIG = {
     "train_ratio": 0.70,
@@ -17,6 +19,8 @@ EDA_CONFIG = {
     "psi_warning": 0.25,
     "corr_threshold": 0.7,
     "vif_threshold": 10,
+    "monotone_spearman_min": 0.6,
+    "woe_bins": 10,
 }
 
 MODEL_CONFIG = {
@@ -86,4 +90,38 @@ REPORT_CONFIG = {
     "output_dir": "reports",
     "fig_dpi": 150,
     "fig_format": "png",
+    # False: scored_*.csv only keeps label/score/bin columns instead of full data copies
+    "save_scored_full": False,
 }
+
+_ALL_CONFIGS = {
+    "SPLIT_CONFIG": SPLIT_CONFIG,
+    "EDA_CONFIG": EDA_CONFIG,
+    "MODEL_CONFIG": MODEL_CONFIG,
+    "STRATEGY_CONFIG": STRATEGY_CONFIG,
+    "REPORT_CONFIG": REPORT_CONFIG,
+}
+
+
+def apply_config_overrides(path: str) -> dict:
+    """Merge a JSON override file ({"MODEL_CONFIG": {"optuna_trials": 20}, ...})
+    into the global config dicts in place. Returns the applied overrides."""
+    # utf-8-sig tolerates the BOM that Windows editors often prepend
+    with open(path, "r", encoding="utf-8-sig") as f:
+        overrides = json.load(f)
+    for section, values in overrides.items():
+        if section not in _ALL_CONFIGS:
+            raise KeyError(f"unknown config section '{section}', expected one of {list(_ALL_CONFIGS)}")
+        if not isinstance(values, dict):
+            raise ValueError(f"config section '{section}' must be an object")
+        for key, value in values.items():
+            if isinstance(_ALL_CONFIGS[section].get(key), dict) and isinstance(value, dict):
+                _ALL_CONFIGS[section][key].update(value)
+            else:
+                _ALL_CONFIGS[section][key] = value
+    return overrides
+
+
+def config_snapshot() -> dict:
+    """Deep copy of all effective config sections, for run reproducibility."""
+    return copy.deepcopy(_ALL_CONFIGS)

@@ -14,9 +14,10 @@ from typing import Optional
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from utils.binning import tree_bin_thresholds, woe_stats
 from utils.helpers import get_logger, calc_psi
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 logger = get_logger("EDA")
 
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
@@ -48,10 +49,7 @@ def calc_woe_iv(df: pd.DataFrame, feature: str, label: str,
             raw_bins[-1] = np.inf
             col_bin = pd.cut(col, bins=raw_bins, labels=False, include_lowest=True, duplicates="drop")
         elif method == "tree":
-            from sklearn.tree import DecisionTreeClassifier
-            dt = DecisionTreeClassifier(max_leaf_nodes=bins, min_samples_leaf=50)
-            dt.fit(col.fillna(col.median()).values.reshape(-1, 1), y)
-            thresholds = sorted(set(dt.tree_.threshold[dt.tree_.threshold != -2]))
+            thresholds = tree_bin_thresholds(col.fillna(col.median()), y, bins=bins)
             raw_bins = [-np.inf] + thresholds + [np.inf]
             col_bin = pd.cut(col, bins=raw_bins,
                              labels=False, duplicates="drop")
@@ -68,29 +66,14 @@ def calc_woe_iv(df: pd.DataFrame, feature: str, label: str,
             right_label = "inf" if np.isposinf(right) else f"{right:.6f}"
             bin_interval_map[idx] = f"({left_label}, {right_label}]"
 
-    tmp = pd.DataFrame({"bin": col_bin, "label": y}).dropna(subset=["bin"])
-    grouped = tmp.groupby("bin")["label"].agg(["sum", "count"])
-    grouped.columns = ["bad", "total"]
-    grouped["good"] = grouped["total"] - grouped["bad"]
-
-    total_bad = grouped["bad"].sum()
-    total_good = grouped["good"].sum()
-
-    grouped["bad_pct"] = grouped["bad"] / total_bad
-    grouped["good_pct"] = grouped["good"] / total_good
-
-    grouped["bad_pct"] = grouped["bad_pct"].replace(0, 1e-6)
-    grouped["good_pct"] = grouped["good_pct"].replace(0, 1e-6)
-
     # WOE = ln(good_pct / bad_pct) — industry standard: higher WOE = lower risk
-    grouped["woe"] = np.log(grouped["good_pct"] / grouped["bad_pct"])
+    grouped = woe_stats(col_bin, y)
     # IV = Σ(good_pct - bad_pct) * WOE  — non-negative when consistent with WOE direction
     grouped["iv_bin"] = (grouped["good_pct"] - grouped["bad_pct"]) * grouped["woe"]
 
     iv = grouped["iv_bin"].sum()
     grouped["iv"] = iv
     grouped["feature"] = feature
-    grouped["bad_rate"] = grouped["bad"] / grouped["total"]
     grouped["bin_interval"] = grouped.index.map(lambda x: bin_interval_map.get(x, str(x)))
 
     return grouped.reset_index()
@@ -107,14 +90,14 @@ def classify_iv(iv: float) -> str:
 # ============================================================
 # 单调性检验
 # ============================================================
-def check_monotonicity(woe_df: pd.DataFrame) -> dict:
+def check_monotonicity(woe_df: pd.DataFrame, min_spearman: float = 0.6) -> dict:
     """检验 WOE 是否单调，返回 spearman 相关系数和是否单调"""
     woe_vals = woe_df["woe"].values
     bins_idx = np.arange(len(woe_vals))
     if len(woe_vals) < 3:
         return {"spearman": np.nan, "is_monotone": False}
     corr, pval = stats.spearmanr(bins_idx, woe_vals)
-    is_monotone = abs(corr) >= 0.6
+    is_monotone = abs(corr) >= min_spearman
     return {"spearman": round(corr, 4), "is_monotone": is_monotone, "pval": round(pval, 4)}
 
 
@@ -129,7 +112,7 @@ class AutoEDA:
 
     # ----------------------------------------------------------
     def run(self, df: pd.DataFrame, label_col: str,
-            report_dir: str = "reports/eda") -> dict:
+            report_dir: str = "reports/eda", time_col: str = None) -> dict:
         """
         一键运行全量 EDA，返回分析结果字典。
         """
@@ -138,7 +121,7 @@ class AutoEDA:
         logger.info("开始 Auto-EDA 分析")
         logger.info("=" * 50)
 
-        feature_cols = [c for c in df.columns if c != label_col]
+        feature_cols = [c for c in df.columns if c != label_col and c != time_col]
 
         # 1. 数据质量
         quality = self._data_quality(df, label_col)
@@ -155,8 +138,8 @@ class AutoEDA:
         # 5. VIF
         vif_table = self._vif(df, feature_cols)
 
-        # 6. PSI（训练集内按时间或随机二分）
-        psi_table = self._psi_internal(df, label_col, feature_cols)
+        # 6. PSI（有时间列时按时间前后二分，否则随机二分）
+        psi_table = self._psi_internal(df, label_col, feature_cols, time_col=time_col)
 
         # 7. 综合评分
         summary = self._feature_summary(
@@ -218,10 +201,11 @@ class AutoEDA:
         # Include both numeric and categorical features (nunique > 1)
         eligible_cols = [c for c in feature_cols if df[c].nunique() > 1 and df[c].nunique() < len(df) * 0.5]
 
+        woe_bins = self.cfg.get("woe_bins", 10)
         for col in eligible_cols:
             try:
                 woe_df = calc_woe_iv(df[[col, label_col]].dropna(),
-                                     col, label_col, bins=10, method="tree")
+                                     col, label_col, bins=woe_bins, method="tree")
                 iv = woe_df["iv"].iloc[0]
                 woe_tables[col] = woe_df
                 iv_rows.append({
@@ -278,9 +262,10 @@ class AutoEDA:
     # ----------------------------------------------------------
     def _monotonicity(self, woe_tables: dict) -> dict:
         logger.info("► 单调性检验 ...")
+        min_spearman = self.cfg.get("monotone_spearman_min", 0.6)
         res = {}
         for feat, woe_df in woe_tables.items():
-            res[feat] = check_monotonicity(woe_df)
+            res[feat] = check_monotonicity(woe_df, min_spearman=min_spearman)
         return res
 
     # ----------------------------------------------------------
@@ -325,20 +310,28 @@ class AutoEDA:
             return pd.DataFrame()
 
     # ----------------------------------------------------------
-    def _psi_internal(self, df, label_col, feature_cols) -> pd.DataFrame:
-        """随机二分数据计算特征 PSI 作为稳定性参考（避免时序偏差）"""
+    def _psi_internal(self, df, label_col, feature_cols, time_col: str = None) -> pd.DataFrame:
+        """特征 PSI：有时间列时按时间前后二分（检测真实漂移），否则随机二分兜底"""
         logger.info("► PSI 稳定性计算 ...")
-        df_shuffled = df.sample(frac=1.0, random_state=42)
-        mid = len(df_shuffled) // 2
-        df1, df2 = df_shuffled.iloc[:mid], df_shuffled.iloc[mid:]
+        if time_col and time_col in df.columns:
+            times = pd.to_datetime(df[time_col], errors="coerce")
+            df_ordered = df.loc[times.sort_values(kind="stable").index]
+            logger.info(f"  按时间列 '{time_col}' 前后二分计算 PSI")
+        else:
+            df_ordered = df.sample(frac=1.0, random_state=42)
+            logger.info("  无时间列，随机二分计算 PSI（仅作参考，检测不到时序漂移）")
+        mid = len(df_ordered) // 2
+        df1, df2 = df_ordered.iloc[:mid], df_ordered.iloc[mid:]
+        psi_stable = self.cfg.get("psi_stable", 0.1)
+        psi_warning = self.cfg.get("psi_warning", 0.25)
         rows = []
         num_cols = [c for c in feature_cols
                     if df[c].dtype in [np.float64, np.int64, float, int]]
         for col in num_cols:
             try:
                 psi_val = calc_psi(df1[col].dropna().values, df2[col].dropna().values)
-                label = ("稳定" if psi_val < 0.1
-                         else "警告" if psi_val < 0.25
+                label = ("稳定" if psi_val < psi_stable
+                         else "警告" if psi_val < psi_warning
                          else "不稳定")
                 rows.append({"feature": col, "PSI": round(psi_val, 4), "PSI_label": label})
             except Exception:
@@ -376,7 +369,7 @@ class AutoEDA:
                 issues.append("高VIF")
             if not mono.get("is_monotone", True):
                 issues.append("WOE不单调")
-            if psi_val > 0.1:
+            if psi_val > self.cfg.get("psi_stable", 0.1):
                 issues.append(f"PSI={psi_val:.3f}不稳定")
             if iv_val < 0.02:
                 issues.append("IV过低")

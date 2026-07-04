@@ -7,7 +7,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config.config import SPLIT_CONFIG
+from config.config import SPLIT_CONFIG, apply_config_overrides, config_snapshot
 from modules.eda.auto_eda import AutoEDA
 from modules.model.auto_model import AutoModel
 from modules.reporting.dashboard import generate_dashboard
@@ -97,7 +97,7 @@ def run_pipeline(
     ]).to_csv(f"{output_dir}/split_profile.csv", index=False)
 
     eda = AutoEDA()
-    eda_results = eda.run(train_df, label_col, report_dir=eda_dir)
+    eda_results = eda.run(train_df, label_col, report_dir=eda_dir, time_col=resolved_time_col)
     iv_table = eda_results.get("iv_table", pd.DataFrame())
 
     model = AutoModel()
@@ -125,6 +125,7 @@ def run_pipeline(
         label_col=label_col,
         iv_table=iv_table,
         report_dir=strategy_dir,
+        time_col=resolved_time_col,
     )
 
     summary = {
@@ -147,11 +148,11 @@ def run_pipeline(
         "n_single_rules": len(strategy_results.get("single_rules", [])),
         "n_tree_rules": len(strategy_results.get("tree_rules", [])),
         "n_stable_rules": len(strategy_results.get("stable_rules", [])),
+        "dashboard_path": f"{output_dir}/dashboard.html",
+        "config": config_snapshot(),
     }
     save_json(summary, f"{output_dir}/run_summary.json")
-    dashboard_path = generate_dashboard(output_dir)
-    summary["dashboard_path"] = dashboard_path
-    save_json(summary, f"{output_dir}/run_summary.json")
+    generate_dashboard(output_dir)
     logger.info(f"pipeline complete | output_dir={output_dir} | best_model={summary['best_model']}")
     return summary
 
@@ -166,7 +167,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", default=None, help="Output directory")
     parser.add_argument("--time-col", default=None, help="Application time column for recent valid split")
     parser.add_argument("--valid-months", type=int, default=None, help="Latest N months used as valid set")
+    parser.add_argument("--config", default=None, help="JSON file overriding config sections, e.g. {\"MODEL_CONFIG\": {\"optuna_trials\": 20}}")
     args = parser.parse_args()
+
+    if args.config:
+        applied = apply_config_overrides(args.config)
+        logger.info(f"config overrides applied from {args.config}: {applied}")
 
     run_pipeline(
         data_path=args.data,

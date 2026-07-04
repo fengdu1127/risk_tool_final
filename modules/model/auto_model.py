@@ -16,9 +16,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+from utils.binning import tree_bin_thresholds, woe_stats
 from utils.helpers import (
     calc_auc,
     calc_ks,
@@ -39,10 +40,9 @@ class WOEEncoder:
         self.woe_maps = {}
         self.thresholds = {}
         self.cat_features = set()
+        self.medians = {}
 
     def fit(self, df: pd.DataFrame, feature_cols: list, label_col: str):
-        from sklearn.tree import DecisionTreeClassifier
-
         for col in feature_cols:
             try:
                 sub = df[[col, label_col]].dropna()
@@ -52,14 +52,7 @@ class WOEEncoder:
                     continue
 
                 if col_data.dtype in [object, "category"] or not pd.api.types.is_numeric_dtype(col_data):
-                    grouped = sub.groupby(col)[label_col].agg(["sum", "count"])
-                    grouped.columns = ["bad", "total"]
-                    grouped["good"] = grouped["total"] - grouped["bad"]
-                    total_bad = max(grouped["bad"].sum(), 1e-6)
-                    total_good = max(grouped["good"].sum(), 1e-6)
-                    grouped["bad_pct"] = (grouped["bad"] / total_bad).replace(0, 1e-6)
-                    grouped["good_pct"] = (grouped["good"] / total_good).replace(0, 1e-6)
-                    grouped["woe"] = np.log(grouped["good_pct"] / grouped["bad_pct"])
+                    grouped = woe_stats(col_data, y_data)
                     self.woe_maps[col] = dict(zip(grouped.index, grouped["woe"]))
                     self.thresholds[col] = list(grouped.index)
                     self.cat_features.add(col)
@@ -68,22 +61,15 @@ class WOEEncoder:
                 if col_data.nunique() < 3:
                     continue
 
-                dt = DecisionTreeClassifier(max_leaf_nodes=self.bins, min_samples_leaf=50, random_state=42)
-                dt.fit(col_data.fillna(col_data.median()).values.reshape(-1, 1), y_data)
-                thresholds = sorted(set(dt.tree_.threshold[dt.tree_.threshold != -2]))
+                self.medians[col] = float(col_data.median())
+                thresholds = tree_bin_thresholds(
+                    col_data.fillna(self.medians[col]), y_data, bins=self.bins
+                )
                 self.thresholds[col] = thresholds
 
                 bins = [-np.inf] + thresholds + [np.inf]
                 col_bin = pd.cut(col_data, bins=bins, labels=False, duplicates="drop")
-                tmp = pd.DataFrame({"bin": col_bin, "label": y_data})
-                grouped = tmp.groupby("bin")["label"].agg(["sum", "count"])
-                grouped.columns = ["bad", "total"]
-                grouped["good"] = grouped["total"] - grouped["bad"]
-                total_bad = max(grouped["bad"].sum(), 1e-6)
-                total_good = max(grouped["good"].sum(), 1e-6)
-                grouped["bad_pct"] = (grouped["bad"] / total_bad).replace(0, 1e-6)
-                grouped["good_pct"] = (grouped["good"] / total_good).replace(0, 1e-6)
-                grouped["woe"] = np.log(grouped["good_pct"] / grouped["bad_pct"])
+                grouped = woe_stats(col_bin, y_data)
                 self.woe_maps[col] = dict(zip(grouped.index, grouped["woe"]))
             except Exception as exc:
                 logger.warning(f"WOE fit failed for {col}: {exc}")
@@ -100,7 +86,9 @@ class WOEEncoder:
             elif col in self.thresholds:
                 thresholds = self.thresholds[col]
                 bins = [-np.inf] + thresholds + [np.inf]
-                col_data = df[col].fillna(df[col].median())
+                # fill with the TRAIN median so scoring is consistent across batches
+                fill_value = self.medians.get(col, df[col].median())
+                col_data = df[col].fillna(fill_value)
                 bin_idx = pd.cut(col_data, bins=bins, labels=False, duplicates="drop")
                 out[col] = pd.Series(bin_idx, index=df.index).map(woe_map).fillna(0).values
         return out
@@ -214,6 +202,7 @@ class AutoModel:
         self.models = {}
         self.woe_encoder = None
         self.feature_cols = []
+        self.xgb_feature_cols = []
         self.label_col = ""
         self.best_algo = None
         self.scorecard = None
@@ -244,6 +233,14 @@ class AutoModel:
         X_test, y_test = test_df[self.feature_cols], test_df[label_col]
         X_valid, y_valid = valid_df[self.feature_cols], valid_df[label_col]
 
+        # Fit the WOE encoder once on train: LR uses it for all features,
+        # XGBoost uses it to encode categorical features.
+        self.woe_encoder = WOEEncoder(bins=10)
+        train_full = X_train.copy()
+        train_full[label_col] = y_train.values
+        self.woe_encoder.fit(train_full, self.feature_cols, label_col)
+        save_pickle(self.woe_encoder, f"{report_dir}/woe_encoder.pkl")
+
         all_reports = []
         if "lr" in algos:
             lr_result = self._train_lr(X_train, y_train, X_test, y_test, X_valid, y_valid, tune, report_dir)
@@ -271,6 +268,7 @@ class AutoModel:
 
         scored = self._score_all(train_df, test_df, valid_df, label_col, report_dir)
         self._save_enhanced_reports(train_df, test_df, valid_df, label_col, report_df, report_dir)
+        self._save_model_meta(report_dir)
 
         self.eval_results = {
             "report_df": report_df,
@@ -281,10 +279,7 @@ class AutoModel:
         return self.eval_results
 
     def _train_lr(self, X_train, y_train, X_test, y_test, X_valid, y_valid, tune, report_dir):
-        self.woe_encoder = WOEEncoder(bins=10)
-        train_full = X_train.copy()
-        train_full[self.label_col] = y_train.values
-        X_train_woe = self.woe_encoder.fit_transform(train_full, self.feature_cols, self.label_col)[self.feature_cols].fillna(0)
+        X_train_woe = self.woe_encoder.transform(X_train.copy(), self.feature_cols)[self.feature_cols].fillna(0)
         X_test_woe = self.woe_encoder.transform(X_test.copy(), self.feature_cols)[self.feature_cols].fillna(0)
         X_valid_woe = self.woe_encoder.transform(X_valid.copy(), self.feature_cols)[self.feature_cols].fillna(0)
         best_params = self._tune_lr(X_train_woe, y_train) if tune else self.cfg["lr_default_params"]
@@ -301,7 +296,6 @@ class AutoModel:
             plot_roc_ks(y.values, prob, f"LR-{name}", f"{report_dir}/lr_roc_ks_{name}.png")
             plot_lift_curve(y.values, prob, f"LR-{name}", f"{report_dir}/lr_lift_{name}.png")
         save_pickle(pipeline, f"{report_dir}/model_lr.pkl")
-        save_pickle(self.woe_encoder, f"{report_dir}/woe_encoder.pkl")
         return {"model": pipeline, "reports": reports}
 
     def _tune_lr(self, X, y) -> dict:
@@ -309,27 +303,41 @@ class AutoModel:
 
         def objective(trial):
             C = trial.suggest_float("C", 0.001, 10, log=True)
-            clf = LogisticRegression(C=C, max_iter=1000, solver="lbfgs", class_weight="balanced", random_state=42)
-            scaler = StandardScaler()
-            Xs = scaler.fit_transform(X)
-            return cross_val_score(clf, Xs, y, cv=self.cfg["cv_folds"], scoring="roc_auc").mean()
+            pipe = Pipeline([
+                ("scaler", StandardScaler()),
+                ("lr", LogisticRegression(C=C, max_iter=1000, solver="lbfgs", class_weight="balanced", random_state=42)),
+            ])
+            return cross_val_score(pipe, X, y, cv=self.cfg["cv_folds"], scoring="roc_auc").mean()
 
-        study = optuna.create_study(direction="maximize")
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=self.cfg["optuna_trials"])
         return {"C": study.best_params["C"], "max_iter": 1000, "solver": "lbfgs", "class_weight": "balanced", "random_state": 42}
 
+    def _prep_xgb_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Numeric features stay raw; categorical features are WOE-encoded so XGB can use them."""
+        num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+        cat_cols = [c for c in X.columns if c not in num_cols and c in self.woe_encoder.cat_features]
+        out = X[num_cols].copy()
+        if cat_cols:
+            encoded = self.woe_encoder.transform(X[cat_cols].copy(), cat_cols)
+            for c in cat_cols:
+                out[c] = encoded[c].values
+        self.xgb_feature_cols = num_cols + cat_cols
+        return out[self.xgb_feature_cols]
+
     def _train_xgboost(self, X_train, y_train, X_test, y_test, X_valid, y_valid, tune, report_dir):
-        num_cols = [c for c in X_train.columns if pd.api.types.is_numeric_dtype(X_train[c])]
-        X_tr, X_te, X_va = X_train[num_cols].copy(), X_test[num_cols].copy(), X_valid[num_cols].copy()
+        X_tr = self._prep_xgb_features(X_train)
+        X_te = self._prep_xgb_features(X_test)
+        X_va = self._prep_xgb_features(X_valid)
         neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
         auto_scale_weight = float(neg / pos) if pos > 0 else 1.0
         if tune:
-            best_params = self._tune_xgb(X_tr, y_train, X_te, y_test, auto_scale_weight)
+            best_params = self._tune_xgb(X_tr, y_train, auto_scale_weight)
         else:
             best_params = self.cfg["xgb_default_params"].copy()
             best_params["scale_pos_weight"] = auto_scale_weight
         model = xgb.XGBClassifier(**best_params)
-        model.fit(X_tr, y_train, eval_set=[(X_te, y_test)], verbose=False)
+        model.fit(X_tr, y_train, verbose=False)
 
         reports = []
         for name, Xd, y in [("train", X_tr, y_train), ("test", X_te, y_test), ("valid", X_va, y_valid)]:
@@ -343,9 +351,17 @@ class AutoModel:
         plot_shap_summary(model, X_te, f"{report_dir}/xgb_shap.png", report_dir)
         self._plot_feature_importance(model, X_tr.columns.tolist(), f"{report_dir}/xgb_feat_importance.png")
         save_pickle(model, f"{report_dir}/model_xgb.pkl")
+        model.save_model(f"{report_dir}/model_xgb.json")
         return {"model": model, "reports": reports}
 
-    def _tune_xgb(self, X_train, y_train, X_val, y_val, scale_pos_weight: float = 1.0) -> dict:
+    def _tune_xgb(self, X_train, y_train, scale_pos_weight: float = 1.0) -> dict:
+        """Tune on an internal split of TRAIN only, so test stays untouched for evaluation."""
+        from sklearn.model_selection import train_test_split
+
+        X_tr, X_in_val, y_tr, y_in_val = train_test_split(
+            X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
+        )
+
         def objective(trial):
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 100, 500),
@@ -360,10 +376,10 @@ class AutoModel:
                 "verbosity": 0,
             }
             clf = xgb.XGBClassifier(**params)
-            clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-            return calc_ks(y_val.values, clf.predict_proba(X_val)[:, 1])
+            clf.fit(X_tr, y_tr, verbose=False)
+            return calc_ks(y_in_val.values, clf.predict_proba(X_in_val)[:, 1])
 
-        study = optuna.create_study(direction="maximize")
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
         study.optimize(objective, n_trials=self.cfg["optuna_trials"])
         best = study.best_params
         best["random_state"] = 42
@@ -371,9 +387,12 @@ class AutoModel:
         return best
 
     def _score_all(self, train_df, test_df, valid_df, label_col, report_dir):
+        from config.config import REPORT_CONFIG
+
         best_model = self.models.get(self.best_algo)
         if best_model is None:
             return {}
+        save_full = REPORT_CONFIG.get("save_scored_full", False)
         scored = {}
         for name, df in [("train", train_df), ("test", test_df), ("valid", valid_df)]:
             df_out = df.copy()
@@ -382,13 +401,36 @@ class AutoModel:
                 X_woe = self.woe_encoder.transform(X.copy(), self.feature_cols)[self.feature_cols].fillna(0)
                 prob = best_model.predict_proba(X_woe)[:, 1]
             else:
-                num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
-                prob = best_model.predict_proba(X[num_cols])[:, 1]
+                prob = best_model.predict_proba(self._prep_xgb_features(X))[:, 1]
             df_out["model_score"] = prob
             df_out["model_score_bin"] = pd.qcut(prob, q=10, labels=False, duplicates="drop")
-            df_out.to_csv(f"{report_dir}/scored_{name}.csv", index=False)
+            if save_full:
+                df_out.to_csv(f"{report_dir}/scored_{name}.csv", index=False)
+            else:
+                df_out[[label_col, "model_score", "model_score_bin"]].to_csv(
+                    f"{report_dir}/scored_{name}.csv", index=False
+                )
             scored[name] = df_out
         return scored
+
+    def _save_model_meta(self, report_dir):
+        import json
+        import sklearn
+
+        meta = {
+            "best_algo": self.best_algo,
+            "label_col": self.label_col,
+            "feature_cols": self.feature_cols,
+            "xgb_feature_cols": self.xgb_feature_cols,
+            "versions": {
+                "pandas": pd.__version__,
+                "numpy": np.__version__,
+                "sklearn": sklearn.__version__,
+                "xgboost": xgb.__version__,
+            },
+        }
+        with open(f"{report_dir}/model_meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
     def _save_enhanced_reports(self, train_df, test_df, valid_df, label_col, report_df, report_dir):
         if not self.best_algo:

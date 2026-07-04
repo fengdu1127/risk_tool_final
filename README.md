@@ -4,7 +4,8 @@
 
 ```
 risk_tool/
-├── pipeline.py              # 主入口（端到端运行）
+├── pipeline.py              # 主入口（端到端训练 + 分析）
+├── score.py                 # 打分入口（用训练好的模型+策略给新数据做决策）
 ├── requirements.txt
 ├── config/
 │   └── config.py            # 全局配置（阈值、参数等）
@@ -45,7 +46,23 @@ python pipeline.py --data data/sample.csv --label is_overdue --algo lr
 
 # 指定输出目录
 python pipeline.py --data data/sample.csv --label is_overdue --algo both --output reports/my_run
+
+# 用时间列做近期验证集切分（推荐，检测真实时序漂移）
+python pipeline.py --data data/sample.csv --label is_overdue --time-col apply_time
+
+# 用外部 JSON 覆盖配置（无需改代码）
+python pipeline.py --data data/sample.csv --label is_overdue --config my_config.json
 ```
+
+### 给新数据打分（部署）
+
+```bash
+python score.py --run-dir reports/my_run --data new_applications.csv --output scored.csv
+```
+
+输出每行的 `model_score`、`decision`（reject / review / approve）、命中的规则和使用的阈值。
+打分使用训练时保存的 WOE 编码器（含训练集中位数填充）、最优模型（XGB 优先加载原生
+`model_xgb.json`）和 `strategy/policy.json` 中的策略（全局阈值 + 分客群阈值 + 稳定拒绝规则）。
 
 ### 参数说明
 
@@ -57,6 +74,9 @@ python pipeline.py --data data/sample.csv --label is_overdue --algo both --outpu
 | `--no-tune` | 跳过超参调优 | False |
 | `--features` | 指定特征列（空格分隔） | 全部列 |
 | `--output` | 输出目录 | 自动生成 |
+| `--time-col` | 申请时间列（启用近期验证集切分） | 无 |
+| `--valid-months` | 最近 N 个月作为验证集 | 3 |
+| `--config` | JSON 配置覆盖文件 | 无 |
 
 ## 数据集划分
 
@@ -84,23 +104,26 @@ python pipeline.py --data data/sample.csv --label is_overdue --algo both --outpu
 
 ```
 run_xxx/
-├── run_summary.json           # 运行汇总（模型指标、规则数等）
-├── split_train/test/holdout.csv
+├── run_summary.json           # 运行汇总（模型指标、规则数、生效配置快照）
+├── dashboard.html             # 可视化报告
+├── split_train/test/valid.csv
 ├── eda/
 │   ├── iv_ranking.png         # IV 排名图
 │   ├── corr_heatmap.png       # 相关性热图
 │   └── woe_trends.png         # WOE 趋势图
 ├── model/
 │   ├── model_lr.pkl           # LR 模型
-│   ├── model_xgb.pkl          # XGBoost 模型
-│   ├── woe_encoder.pkl        # WOE 编码器
+│   ├── model_xgb.pkl / .json  # XGBoost 模型（pickle + 原生 JSON）
+│   ├── model_meta.json        # 打分元数据（特征列表、最优算法、依赖版本）
+│   ├── woe_encoder.pkl        # WOE 编码器（含训练集中位数）
 │   ├── scorecard_lr.csv       # 标准评分卡
 │   ├── model_comparison.csv   # 模型对比指标
 │   ├── xgb_shap.png           # SHAP 特征解释图
 │   ├── *_roc_ks_*.png         # ROC/KS 曲线
 │   ├── *_lift_*.png           # Lift 曲线
-│   └── scored_*.csv           # 含模型评分的数据集
+│   └── scored_*.csv           # 模型评分（默认仅 label/score/bin，可配置输出全量）
 └── strategy/
+    ├── policy.json            # 机器可读策略（score.py 直接消费）
     ├── variable_selection.csv # 变量筛选报告
     ├── rules_all.csv          # 全部规则清单
     ├── backtest_results.csv   # 三集回测结果
@@ -111,16 +134,14 @@ run_xxx/
 
 ## 调整配置
 
-编辑 `config/config.py` 调整所有阈值和参数，无需修改代码。
+推荐用 `--config` 传 JSON 覆盖文件，无需修改代码：
 
-```python
-# 例：放宽单调性要求
-STRATEGY_CONFIG["monotone_spearman_min"] = 0.4
-
-# 例：调整规则覆盖率上限为 3%
-STRATEGY_CONFIG["rule_max_coverage"] = 0.03
-
-# 例：调整数据集划分比例
-SPLIT_CONFIG["train_ratio"] = 0.60
-SPLIT_CONFIG["holdout_ratio"] = 0.20
+```json
+{
+  "STRATEGY_CONFIG": {"monotone_spearman_min": 0.4, "rule_max_coverage": 0.03},
+  "MODEL_CONFIG": {"optuna_trials": 20},
+  "SPLIT_CONFIG": {"train_ratio": 0.60, "holdout_ratio": 0.25}
+}
 ```
+
+也可以直接编辑 `config/config.py`。每次运行生效的完整配置会快照到 `run_summary.json` 的 `config` 字段，保证可复现。

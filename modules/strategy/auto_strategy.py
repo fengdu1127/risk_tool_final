@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.tree import DecisionTreeClassifier, plot_tree
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from modules.eda.auto_eda import calc_woe_iv, check_monotonicity
 from utils.helpers import calc_lift, calc_psi, get_logger
@@ -27,15 +27,15 @@ class VariableSelector:
         self.dropped = {}
         self.selector_report = []
 
-    def fit(self, df: pd.DataFrame, label_col: str, iv_table: pd.DataFrame = None) -> list:
-        all_features = [c for c in df.columns if c != label_col]
+    def fit(self, df: pd.DataFrame, label_col: str, iv_table: pd.DataFrame = None, time_col: str = None) -> list:
+        all_features = [c for c in df.columns if c != label_col and c != time_col]
         num_cols = [c for c in all_features if pd.api.types.is_numeric_dtype(df[c])]
         cat_cols = [c for c in all_features if c not in num_cols]
         iv_map = dict(zip(iv_table["feature"], iv_table["IV"])) if iv_table is not None and len(iv_table) else {}
 
         num_pool = self._drop_high_corr(df, num_cols, iv_map)
         num_pool = self._filter_monotone(df, num_pool, label_col)
-        num_pool = self._filter_stable(df, num_pool)
+        num_pool = self._filter_stable(df, num_pool, time_col=time_col)
         cat_pool = [c for c in cat_cols if c in iv_map]
         for c in [c for c in cat_cols if c not in iv_map]:
             self.dropped[c] = "IV calculation unavailable"
@@ -67,7 +67,7 @@ class VariableSelector:
         for feat in pool:
             try:
                 wdf = calc_woe_iv(df[[feat, label_col]].dropna(), feat, label_col, bins=10, method="tree")
-                mono = check_monotonicity(wdf)
+                mono = check_monotonicity(wdf, min_spearman=min_spearman)
                 spearman = abs(mono.get("spearman", 0) or 0)
                 self.selector_report.append({"feature": feat, "spearman": mono.get("spearman", np.nan), "is_monotone": mono.get("is_monotone", False)})
                 if mono.get("is_monotone", False) and spearman >= min_spearman:
@@ -78,11 +78,15 @@ class VariableSelector:
                 self.dropped[feat] = f"monotonicity failed: {exc}"
         return passing
 
-    def _filter_stable(self, df, pool):
+    def _filter_stable(self, df, pool, time_col: str = None):
         psi_max = self.cfg["psi_max"]
-        df_shuffled = df.sample(frac=1.0, random_state=42)
-        mid = len(df_shuffled) // 2
-        df1, df2 = df_shuffled.iloc[:mid], df_shuffled.iloc[mid:]
+        if time_col and time_col in df.columns:
+            times = pd.to_datetime(df[time_col], errors="coerce")
+            df_ordered = df.loc[times.sort_values(kind="stable").index]
+        else:
+            df_ordered = df.sample(frac=1.0, random_state=42)
+        mid = len(df_ordered) // 2
+        df1, df2 = df_ordered.iloc[:mid], df_ordered.iloc[mid:]
         passing = []
         for feat in pool:
             try:
@@ -352,12 +356,13 @@ class AutoStrategy:
         label_col: str = "",
         iv_table: pd.DataFrame = None,
         report_dir: str = "reports/strategy",
+        time_col: str = None,
     ) -> dict:
         os.makedirs(report_dir, exist_ok=True)
         if valid_df is None:
             valid_df = holdout_df
 
-        self.selected_vars = self.selector.fit(train_df, label_col, iv_table)
+        self.selected_vars = self.selector.fit(train_df, label_col, iv_table, time_col=time_col)
         if not self.selected_vars:
             logger.error("no usable variables after selection")
             return {}
@@ -404,6 +409,8 @@ class AutoStrategy:
         )
         strategy_leaderboard = self._strategy_leaderboard(final_comparison)
         strategy_recommendation = self._strategy_recommendation(strategy_leaderboard)
+        policy = self._build_policy(label_col, stable_rules, overall_recommendation, segment_recommendation)
+        self._save_policy(policy, report_dir)
 
         self._save_outputs(
             all_rules,
@@ -428,6 +435,7 @@ class AutoStrategy:
         )
         return {
             "selected_vars": self.selected_vars,
+            "policy": policy,
             "single_rules": self.single_rules,
             "tree_rules": self.tree_rules,
             "all_rules": all_rules,
@@ -1057,6 +1065,61 @@ class AutoStrategy:
             "overall_bad_rate": round(float(overall_bad), 6),
             "lift": round(float(reject_bad / overall_bad), 6) if overall_bad else 0.0,
         }
+
+    def _build_policy(self, label_col, stable_rules, overall_recommendation, segment_recommendation) -> dict:
+        """Serialize the recommended strategy into a machine-readable policy for score.py."""
+        from datetime import datetime
+
+        policy = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "label_col": label_col,
+            "score_thresholds": None,
+            "segment_overrides": [],
+            "reject_rules": [],
+        }
+        if not overall_recommendation.empty and "reject_threshold" in overall_recommendation.columns:
+            first = overall_recommendation.iloc[0]
+            policy["score_thresholds"] = {
+                "reject": float(first["reject_threshold"]),
+                "review": float(first["review_threshold"]),
+            }
+        if not segment_recommendation.empty and "recommend_segment_strategy" in segment_recommendation.columns:
+            recommended = segment_recommendation[
+                segment_recommendation["recommend_segment_strategy"].fillna(False)
+            ].drop_duplicates(["segment_feature", "segment_value"])
+            for _, row in recommended.iterrows():
+                value = row.get("segment_value")
+                policy["segment_overrides"].append({
+                    "feature": row.get("segment_feature"),
+                    "value": None if pd.isna(value) else value,
+                    "reject_threshold": float(row["reject_threshold"]),
+                    "review_threshold": float(row["review_threshold"]),
+                })
+        if stable_rules is not None and len(stable_rules):
+            for _, rule in stable_rules.iterrows():
+                conditions = rule.get("conditions", None)
+                if isinstance(conditions, str):
+                    try:
+                        conditions = ast.literal_eval(conditions)
+                    except Exception:
+                        conditions = None
+                entry = {
+                    "rule_type": rule.get("rule_type", "single"),
+                    "condition_str": rule.get("condition_str", rule.get("condition", "")),
+                }
+                if entry["rule_type"] == "single":
+                    entry["feature"] = rule.get("feature")
+                    entry["direction"] = rule.get("direction")
+                    entry["threshold"] = rule.get("threshold")
+                elif isinstance(conditions, list):
+                    entry["conditions"] = conditions
+                policy["reject_rules"].append(entry)
+        return policy
+
+    def _save_policy(self, policy: dict, report_dir: str):
+        from utils.helpers import save_json
+
+        save_json(policy, f"{report_dir}/policy.json")
 
     def _save_outputs(
         self,
