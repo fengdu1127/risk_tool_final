@@ -49,7 +49,7 @@ def calc_woe_iv(df: pd.DataFrame, feature: str, label: str,
             raw_bins[-1] = np.inf
             col_bin = pd.cut(col, bins=raw_bins, labels=False, include_lowest=True, duplicates="drop")
         elif method == "tree":
-            thresholds = tree_bin_thresholds(col.fillna(col.median()), y, bins=bins)
+            thresholds = tree_bin_thresholds(col.dropna(), y[col.notna()], bins=bins)
             raw_bins = [-np.inf] + thresholds + [np.inf]
             col_bin = pd.cut(col, bins=raw_bins,
                              labels=False, duplicates="drop")
@@ -65,6 +65,11 @@ def calc_woe_iv(df: pd.DataFrame, feature: str, label: str,
             left_label = "-inf" if np.isneginf(left) else f"{left:.6f}"
             right_label = "inf" if np.isposinf(right) else f"{right:.6f}"
             bin_interval_map[idx] = f"({left_label}, {right_label}]"
+        # missing values form their own bin (-1) instead of being dropped
+        if col.isna().any():
+            col_bin = pd.Series(col_bin, index=col.index)
+            col_bin[col.isna()] = -1
+            bin_interval_map[-1] = "MISSING"
 
     # WOE = ln(good_pct / bad_pct) — industry standard: higher WOE = lower risk
     grouped = woe_stats(col_bin, y)
@@ -204,7 +209,8 @@ class AutoEDA:
         woe_bins = self.cfg.get("woe_bins", 10)
         for col in eligible_cols:
             try:
-                woe_df = calc_woe_iv(df[[col, label_col]].dropna(),
+                # keep rows with missing feature values: they get their own bin
+                woe_df = calc_woe_iv(df[[col, label_col]].dropna(subset=[label_col]),
                                      col, label_col, bins=woe_bins, method="tree")
                 iv = woe_df["iv"].iloc[0]
                 woe_tables[col] = woe_df
@@ -265,7 +271,9 @@ class AutoEDA:
         min_spearman = self.cfg.get("monotone_spearman_min", 0.6)
         res = {}
         for feat, woe_df in woe_tables.items():
-            res[feat] = check_monotonicity(woe_df, min_spearman=min_spearman)
+            # the missing bin (-1) has no natural order; exclude it from the trend check
+            ordered = woe_df[woe_df["bin"] != -1] if "bin" in woe_df.columns else woe_df
+            res[feat] = check_monotonicity(ordered, min_spearman=min_spearman)
         return res
 
     # ----------------------------------------------------------

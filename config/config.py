@@ -29,6 +29,11 @@ MODEL_CONFIG = {
     "optuna_trials": 50,
     "random_state": 42,
     "primary_metric": "KS",
+    # missing values get their own WOE bin when train has at least this many
+    "woe_missing_min_samples": 50,
+    # constrain XGB predictions to be monotone in each feature's risk direction
+    "xgb_monotone": True,
+    "xgb_monotone_min_abs_corr": 0.02,
     "lr_default_params": {
         "C": 1.0,
         "max_iter": 1000,

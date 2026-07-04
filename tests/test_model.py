@@ -6,7 +6,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from modules.model.auto_model import WOEEncoder
+from modules.model.auto_model import AutoModel, WOEEncoder, MISSING_BIN
 
 
 @pytest.fixture
@@ -116,3 +116,71 @@ class TestWOEEncoder:
         assert "score" not in enc.cat_features
         transformed = enc.transform(df, features)
         assert not transformed[["score", "age", "gender"]].isna().any(axis=None)
+
+
+class TestMissingBin:
+    @pytest.fixture
+    def missing_df(self):
+        """Numeric feature where missing rows are clearly riskier than the rest."""
+        np.random.seed(42)
+        n = 600
+        df = pd.DataFrame({"x": np.random.normal(650, 80, n)})
+        prob_bad = 1 / (1 + np.exp((df["x"] - 550) / 80))
+        df["label"] = (np.random.random(n) < prob_bad).astype(int)
+        missing_idx = df.index[:150]
+        df.loc[missing_idx, "x"] = np.nan
+        df.loc[missing_idx, "label"] = (np.random.random(150) < 0.8).astype(int)
+        return df
+
+    def test_missing_gets_own_bin(self, missing_df):
+        enc = WOEEncoder(bins=5, missing_min_samples=50)
+        enc.fit(missing_df, ["x"], "label")
+        assert MISSING_BIN in enc.woe_maps["x"]
+        # missing rows are risky -> WOE = ln(good/bad) should be negative
+        assert enc.woe_maps["x"][MISSING_BIN] < 0
+
+    def test_transform_maps_missing_to_missing_woe(self, missing_df):
+        enc = WOEEncoder(bins=5, missing_min_samples=50)
+        enc.fit(missing_df, ["x"], "label")
+        new = pd.DataFrame({"x": [650.0, np.nan]})
+        out = enc.transform(new, ["x"])
+        assert abs(out.loc[1, "x"] - enc.woe_maps["x"][MISSING_BIN]) < 1e-9
+        assert out.loc[0, "x"] != out.loc[1, "x"]
+
+    def test_few_missing_falls_back_to_neutral(self):
+        np.random.seed(0)
+        n = 400
+        df = pd.DataFrame({"x": np.random.normal(0, 1, n)})
+        df["label"] = (np.random.random(n) < 0.3).astype(int)
+        df.loc[df.index[:5], "x"] = np.nan  # below missing_min_samples
+        enc = WOEEncoder(bins=5, missing_min_samples=50)
+        enc.fit(df, ["x"], "label")
+        assert MISSING_BIN not in enc.woe_maps["x"]
+        out = enc.transform(pd.DataFrame({"x": [np.nan]}), ["x"])
+        assert out.loc[0, "x"] == 0  # neutral WOE
+
+
+class TestMonotoneConstraints:
+    def test_directions_from_risk_correlation(self):
+        np.random.seed(42)
+        n = 800
+        X = pd.DataFrame({
+            "risk_up": np.arange(n, dtype=float),      # higher -> more bad
+            "risk_down": -np.arange(n, dtype=float),   # higher -> less bad
+            "noise": np.random.normal(0, 1, n),
+            "channel": np.random.normal(0, 1, n),      # stands in for a WOE-encoded categorical
+        })
+        y = pd.Series((np.arange(n) + np.random.normal(0, 100, n) > n / 2).astype(int))
+        # threshold above chance-level correlation (~1/sqrt(n)) so noise stays at 0
+        model = AutoModel(config={"xgb_monotone": True, "xgb_monotone_min_abs_corr": 0.1})
+        model.woe_encoder = WOEEncoder()
+        model.woe_encoder.cat_features = {"channel"}
+        constraints = model._xgb_monotone_constraints(X, y)
+        assert constraints[0] == 1    # risk_up
+        assert constraints[1] == -1   # risk_down
+        assert constraints[2] == 0    # noise stays unconstrained
+        assert constraints[3] == -1   # WOE-encoded categorical always -1
+
+    def test_disabled_via_config(self):
+        model = AutoModel(config={"xgb_monotone": False})
+        assert model._xgb_monotone_constraints(pd.DataFrame({"a": [1.0, 2.0]}), pd.Series([0, 1])) is None

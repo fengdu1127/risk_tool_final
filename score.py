@@ -80,6 +80,34 @@ def build_features(df: pd.DataFrame, meta: dict, encoder) -> pd.DataFrame:
     return X[xgb_cols]
 
 
+def compute_drift(df: pd.DataFrame, baseline: dict, floor: float = 1e-6) -> pd.DataFrame:
+    """PSI + missing-rate shift of the new batch vs the training distribution."""
+    rows = []
+    for col, base in (baseline or {}).items():
+        if col not in df.columns:
+            continue
+        edges = np.array([-np.inf] + list(base["breakpoints"]) + [np.inf])
+        expected = np.asarray(base["expected_pct"], dtype=float)
+        vals = pd.to_numeric(df[col], errors="coerce").dropna().values
+        if len(vals) == 0 or len(expected) != len(edges) - 1:
+            continue
+        counts, _ = np.histogram(vals, bins=edges)
+        actual = counts / counts.sum()
+        expected_f = np.where(expected == 0, floor, expected)
+        actual_f = np.where(actual == 0, floor, actual)
+        psi = float(np.sum((actual_f - expected_f) * np.log(actual_f / expected_f)))
+        new_missing = float(df[col].isna().mean())
+        rows.append({
+            "feature": col,
+            "PSI": round(psi, 6),
+            "psi_level": "stable" if psi < 0.1 else "warning" if psi < 0.25 else "unstable",
+            "train_missing_rate": round(base.get("missing_rate", 0.0), 6),
+            "new_missing_rate": round(new_missing, 6),
+            "missing_rate_delta": round(new_missing - base.get("missing_rate", 0.0), 6),
+        })
+    return pd.DataFrame(rows).sort_values("PSI", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+
+
 def apply_policy(df: pd.DataFrame, scores: np.ndarray, policy: dict) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     out["model_score"] = scores
@@ -134,6 +162,22 @@ def run_scoring(run_dir: str, data_path: str, output_path: str = None, id_col: s
     df = pd.read_csv(data_path)
     logger.info(f"scoring {len(df)} rows with model from {run_dir} (best_algo={artifacts['meta']['best_algo']})")
 
+    drift = compute_drift(df, artifacts["meta"].get("drift_baseline"))
+    if not drift.empty:
+        unstable = drift[drift["psi_level"] == "unstable"]["feature"].tolist()
+        warning = drift[drift["psi_level"] == "warning"]["feature"].tolist()
+        missing_shift = drift[drift["missing_rate_delta"].abs() > 0.10]["feature"].tolist()
+        if unstable:
+            logger.warning(f"DRIFT ALERT - unstable features (PSI>=0.25): {unstable}")
+        if warning:
+            logger.warning(f"drift warning (0.1<=PSI<0.25): {warning}")
+        if missing_shift:
+            logger.warning(f"missing-rate shift >10pp: {missing_shift}")
+        if not (unstable or warning or missing_shift):
+            logger.info("drift check passed: all features stable vs train")
+    else:
+        logger.warning("no drift baseline in model_meta.json; skipping drift check")
+
     X = build_features(df, artifacts["meta"], artifacts["encoder"])
     scores = artifacts["model"].predict_proba(X)[:, 1]
     result = apply_policy(df, scores, artifacts["policy"])
@@ -145,6 +189,10 @@ def run_scoring(run_dir: str, data_path: str, output_path: str = None, id_col: s
         os.path.dirname(data_path) or ".", "scored_output.csv"
     )
     result.to_csv(output_path, index=False)
+    if not drift.empty:
+        drift_path = os.path.splitext(output_path)[0] + "_drift.csv"
+        drift.to_csv(drift_path, index=False)
+        logger.info(f"drift report saved: {drift_path}")
     if "decision" in result.columns:
         dist = result["decision"].value_counts(normalize=True).round(4).to_dict()
         logger.info(f"decision distribution: {dist}")

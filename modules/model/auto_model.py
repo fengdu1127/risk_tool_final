@@ -34,9 +34,15 @@ from utils.helpers import (
 logger = get_logger("MODEL")
 
 
+MISSING_BIN = -1
+
+
 class WOEEncoder:
-    def __init__(self, bins: int = 10):
+    def __init__(self, bins: int = 10, missing_min_samples: int = 50):
         self.bins = bins
+        # missing values form their own bin when train has enough of them,
+        # otherwise they fall back to neutral WOE 0 at transform time
+        self.missing_min_samples = missing_min_samples
         self.woe_maps = {}
         self.thresholds = {}
         self.cat_features = set()
@@ -45,9 +51,10 @@ class WOEEncoder:
     def fit(self, df: pd.DataFrame, feature_cols: list, label_col: str):
         for col in feature_cols:
             try:
-                sub = df[[col, label_col]].dropna()
-                col_data = sub[col]
-                y_data = sub[label_col]
+                sub = df[[col, label_col]].dropna(subset=[label_col])
+                missing_mask = sub[col].isna()
+                col_data = sub.loc[~missing_mask, col]
+                y_data = sub.loc[~missing_mask, label_col]
                 if col_data.nunique() < 2:
                     continue
 
@@ -62,14 +69,17 @@ class WOEEncoder:
                     continue
 
                 self.medians[col] = float(col_data.median())
-                thresholds = tree_bin_thresholds(
-                    col_data.fillna(self.medians[col]), y_data, bins=self.bins
-                )
+                thresholds = tree_bin_thresholds(col_data, y_data, bins=self.bins)
                 self.thresholds[col] = thresholds
 
                 bins = [-np.inf] + thresholds + [np.inf]
-                col_bin = pd.cut(col_data, bins=bins, labels=False, duplicates="drop")
-                grouped = woe_stats(col_bin, y_data)
+                col_bin = pd.Series(
+                    pd.cut(sub[col], bins=bins, labels=False, duplicates="drop"),
+                    index=sub.index,
+                )
+                if int(missing_mask.sum()) >= self.missing_min_samples:
+                    col_bin[missing_mask] = MISSING_BIN
+                grouped = woe_stats(col_bin, sub[label_col])
                 self.woe_maps[col] = dict(zip(grouped.index, grouped["woe"]))
             except Exception as exc:
                 logger.warning(f"WOE fit failed for {col}: {exc}")
@@ -86,11 +96,14 @@ class WOEEncoder:
             elif col in self.thresholds:
                 thresholds = self.thresholds[col]
                 bins = [-np.inf] + thresholds + [np.inf]
-                # fill with the TRAIN median so scoring is consistent across batches
-                fill_value = self.medians.get(col, df[col].median())
-                col_data = df[col].fillna(fill_value)
-                bin_idx = pd.cut(col_data, bins=bins, labels=False, duplicates="drop")
-                out[col] = pd.Series(bin_idx, index=df.index).map(woe_map).fillna(0).values
+                bin_idx = pd.Series(
+                    pd.cut(df[col], bins=bins, labels=False, duplicates="drop"),
+                    index=df.index,
+                )
+                # NaN bin = missing value; maps to the missing bin's WOE when it
+                # was fitted, otherwise falls through to neutral 0
+                bin_idx = bin_idx.fillna(MISSING_BIN)
+                out[col] = bin_idx.map(woe_map).fillna(0).values
         return out
 
     def fit_transform(self, df, feature_cols, label_col):
@@ -203,6 +216,7 @@ class AutoModel:
         self.woe_encoder = None
         self.feature_cols = []
         self.xgb_feature_cols = []
+        self.xgb_monotone_constraints = None
         self.label_col = ""
         self.best_algo = None
         self.scorecard = None
@@ -235,7 +249,9 @@ class AutoModel:
 
         # Fit the WOE encoder once on train: LR uses it for all features,
         # XGBoost uses it to encode categorical features.
-        self.woe_encoder = WOEEncoder(bins=10)
+        self.woe_encoder = WOEEncoder(
+            bins=10, missing_min_samples=self.cfg.get("woe_missing_min_samples", 50)
+        )
         train_full = X_train.copy()
         train_full[label_col] = y_train.values
         self.woe_encoder.fit(train_full, self.feature_cols, label_col)
@@ -268,7 +284,7 @@ class AutoModel:
 
         scored = self._score_all(train_df, test_df, valid_df, label_col, report_dir)
         self._save_enhanced_reports(train_df, test_df, valid_df, label_col, report_df, report_dir)
-        self._save_model_meta(report_dir)
+        self._save_model_meta(report_dir, train_df)
 
         self.eval_results = {
             "report_df": report_df,
@@ -325,17 +341,44 @@ class AutoModel:
         self.xgb_feature_cols = num_cols + cat_cols
         return out[self.xgb_feature_cols]
 
+    def _xgb_monotone_constraints(self, X: pd.DataFrame, y: pd.Series):
+        """Per-feature monotone direction for XGB, from spearman risk correlation.
+
+        WOE-encoded categoricals are always -1 (higher WOE = lower risk); weakly
+        correlated numerics stay unconstrained (0).
+        """
+        if not self.cfg.get("xgb_monotone", True):
+            return None
+        from scipy.stats import spearmanr
+
+        min_corr = self.cfg.get("xgb_monotone_min_abs_corr", 0.02)
+        constraints = []
+        for col in X.columns:
+            if col in self.woe_encoder.cat_features:
+                constraints.append(-1)
+                continue
+            corr = spearmanr(X[col], y, nan_policy="omit").correlation
+            if corr is None or np.isnan(corr) or abs(corr) < min_corr:
+                constraints.append(0)
+            else:
+                constraints.append(1 if corr > 0 else -1)
+        return tuple(constraints)
+
     def _train_xgboost(self, X_train, y_train, X_test, y_test, X_valid, y_valid, tune, report_dir):
         X_tr = self._prep_xgb_features(X_train)
         X_te = self._prep_xgb_features(X_test)
         X_va = self._prep_xgb_features(X_valid)
         neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
         auto_scale_weight = float(neg / pos) if pos > 0 else 1.0
+        constraints = self._xgb_monotone_constraints(X_tr, y_train)
+        self.xgb_monotone_constraints = constraints
         if tune:
-            best_params = self._tune_xgb(X_tr, y_train, auto_scale_weight)
+            best_params = self._tune_xgb(X_tr, y_train, auto_scale_weight, constraints)
         else:
             best_params = self.cfg["xgb_default_params"].copy()
             best_params["scale_pos_weight"] = auto_scale_weight
+        if constraints is not None:
+            best_params["monotone_constraints"] = constraints
         model = xgb.XGBClassifier(**best_params)
         model.fit(X_tr, y_train, verbose=False)
 
@@ -354,7 +397,7 @@ class AutoModel:
         model.save_model(f"{report_dir}/model_xgb.json")
         return {"model": model, "reports": reports}
 
-    def _tune_xgb(self, X_train, y_train, scale_pos_weight: float = 1.0) -> dict:
+    def _tune_xgb(self, X_train, y_train, scale_pos_weight: float = 1.0, monotone_constraints=None) -> dict:
         """Tune on an internal split of TRAIN only, so test stays untouched for evaluation."""
         from sklearn.model_selection import train_test_split
 
@@ -375,6 +418,8 @@ class AutoModel:
                 "random_state": 42,
                 "verbosity": 0,
             }
+            if monotone_constraints is not None:
+                params["monotone_constraints"] = monotone_constraints
             clf = xgb.XGBClassifier(**params)
             clf.fit(X_tr, y_tr, verbose=False)
             return calc_ks(y_in_val.values, clf.predict_proba(X_in_val)[:, 1])
@@ -413,7 +458,29 @@ class AutoModel:
             scored[name] = df_out
         return scored
 
-    def _save_model_meta(self, report_dir):
+    def _drift_baseline(self, train_df: pd.DataFrame, bins: int = 10) -> dict:
+        """Per-feature train distribution (quantile bins + missing rate) for scoring-time PSI."""
+        baseline = {}
+        for col in self.feature_cols:
+            if col not in train_df.columns or not pd.api.types.is_numeric_dtype(train_df[col]):
+                continue
+            vals = train_df[col].dropna().values
+            if len(vals) < 10:
+                continue
+            edges = np.unique(np.quantile(vals, np.linspace(0, 1, bins + 1)))
+            interior = [float(e) for e in edges[1:-1]]
+            if not interior:
+                continue
+            full_edges = np.array([-np.inf] + interior + [np.inf])
+            counts, _ = np.histogram(vals, bins=full_edges)
+            baseline[col] = {
+                "breakpoints": interior,
+                "expected_pct": [float(c) for c in counts / counts.sum()],
+                "missing_rate": float(train_df[col].isna().mean()),
+            }
+        return baseline
+
+    def _save_model_meta(self, report_dir, train_df: pd.DataFrame = None):
         import json
         import sklearn
 
@@ -422,6 +489,8 @@ class AutoModel:
             "label_col": self.label_col,
             "feature_cols": self.feature_cols,
             "xgb_feature_cols": self.xgb_feature_cols,
+            "xgb_monotone_constraints": list(self.xgb_monotone_constraints)
+            if self.xgb_monotone_constraints is not None else None,
             "versions": {
                 "pandas": pd.__version__,
                 "numpy": np.__version__,
@@ -429,6 +498,8 @@ class AutoModel:
                 "xgboost": xgb.__version__,
             },
         }
+        if train_df is not None:
+            meta["drift_baseline"] = self._drift_baseline(train_df)
         with open(f"{report_dir}/model_meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 

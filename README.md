@@ -67,8 +67,11 @@ python score.py --run-dir reports/my_run --data new_applications.csv --output sc
 ```
 
 输出每行的 `model_score`、`decision`（reject / review / approve）、命中的规则和使用的阈值。
-打分使用训练时保存的 WOE 编码器（含训练集中位数填充）、最优模型（XGB 优先加载原生
+打分使用训练时保存的 WOE 编码器（缺失值独立分箱）、最优模型（XGB 优先加载原生
 `model_xgb.json`）和 `strategy/policy.json` 中的策略（全局阈值 + 分客群阈值 + 稳定拒绝规则）。
+
+打分时自动做**输入漂移检查**：新批次每个特征相对训练集的 PSI 和缺失率变化，
+PSI ≥ 0.25 或缺失率漂移 > 10pp 会在日志中告警，明细写入 `<output>_drift.csv`。
 
 ### 参数说明
 
@@ -99,6 +102,8 @@ python score.py --run-dir reports/my_run --data new_applications.csv --output sc
 | 高相关性剔除阈值 | 0.7 | Spearman 相关系数 |
 | VIF 剔除阈值 | 10 | 方差膨胀因子 |
 | WOE 单调性阈值 | 0.6 | Spearman 绝对值 |
+| 缺失独立分箱最小样本 | 50 | 低于则缺失取中性 WOE 0 |
+| XGB 单调性约束 | 开启 | 方向由特征-标签 Spearman 自动推导 |
 | PSI 稳定性上限 | 0.1 | 超过则剔除 |
 | 单规则覆盖率上限 | 5% | 超过不输出 |
 | 单规则 Lift 下限 | 2.0 | 低于不输出 |
