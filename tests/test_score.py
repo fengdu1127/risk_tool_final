@@ -133,3 +133,65 @@ class TestEndToEnd:
         assert result["model_score"].between(0, 1).all()
         if "decision" in result.columns:
             assert set(result["decision"].unique()).issubset({"reject", "review", "approve"})
+
+
+class TestPromoteAndCompare:
+    def _make_run(self, root, name, ks=0.35):
+        run = root / name
+        (run / "model").mkdir(parents=True)
+        (run / "strategy").mkdir(parents=True)
+        (run / "model" / "model_meta.json").write_text("{}", encoding="utf-8")
+        (run / "model" / "woe_encoder.pkl").write_bytes(b"x")
+        (run / "strategy" / "policy.json").write_text(
+            json.dumps({"score_thresholds": {"reject": 0.8, "review": 0.6},
+                        "reject_rules": [], "segment_overrides": []}),
+            encoding="utf-8",
+        )
+        (run / "run_summary.json").write_text(json.dumps({
+            "n_total": 1000, "best_model": "lr", "n_selected_vars": 5, "n_stable_rules": 2,
+            "model_metrics": [{"model": "lr", "dataset": "valid", "KS": ks, "AUC": 0.7, "Gini": 0.4}],
+            "overfit_diagnostics": {"train_test_ks_gap": 0.05},
+        }), encoding="utf-8")
+        return run
+
+    def test_promote_writes_pointer(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from promote import promote
+        run = self._make_run(tmp_path, "run_a")
+        promote(str(run))
+        pointer = tmp_path / "reports" / "PRODUCTION"
+        assert pointer.exists()
+        assert pointer.read_text(encoding="utf-8").strip() == str(run.resolve())
+
+    def test_promote_rejects_incomplete_run(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from promote import promote
+        incomplete = tmp_path / "run_bad"
+        (incomplete / "model").mkdir(parents=True)
+        with pytest.raises(FileNotFoundError):
+            promote(str(incomplete))
+
+    def test_resolve_run_dir_uses_pointer(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from promote import promote
+        from score import resolve_run_dir
+        run = self._make_run(tmp_path, "run_a")
+        promote(str(run))
+        assert resolve_run_dir(None) == str(run.resolve())
+        assert resolve_run_dir("explicit_dir") == "explicit_dir"
+
+    def test_resolve_run_dir_without_pointer_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from score import resolve_run_dir
+        with pytest.raises(ValueError):
+            resolve_run_dir(None)
+
+    def test_compare_runs_delta(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from compare_runs import compare_runs
+        run_a = self._make_run(tmp_path, "run_a", ks=0.30)
+        run_b = self._make_run(tmp_path, "run_b", ks=0.36)
+        diff = compare_runs(str(run_a), str(run_b))
+        row = diff[diff["metric"] == "lr_valid_KS"].iloc[0]
+        assert abs(row["delta_b_minus_a"] - 0.06) < 1e-9
+        assert (diff["metric"] == "policy_reject_threshold").any()

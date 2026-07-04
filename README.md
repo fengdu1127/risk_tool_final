@@ -6,7 +6,9 @@
 risk_tool/
 ├── pipeline.py              # 主入口（端到端训练 + 分析）
 ├── score.py                 # 打分入口（用训练好的模型+策略给新数据做决策）
-├── requirements.txt
+├── promote.py               # 把某次 run 设为生产版本（score.py 默认使用）
+├── compare_runs.py          # 两次 run 的指标/策略对比
+├── requirements.txt         # 锁定版本（与模型产物兼容性绑定）
 ├── config/
 │   └── config.py            # 全局配置（阈值、参数等）
 ├── data/
@@ -63,10 +65,22 @@ python pipeline.py --data data/sample.csv --label is_overdue --config my_config.
 ### 给新数据打分（部署）
 
 ```bash
-python score.py --run-dir reports/my_run --data new_applications.csv --output scored.csv
+# 先把某次 run 设为生产版本（写入 reports/PRODUCTION 指针）
+python promote.py reports/my_run
+
+# 之后打分不用再指定 run 目录
+python score.py --data new_applications.csv --output scored.csv
+
+# 也可以显式指定某次 run
+python score.py --run-dir reports/my_run --data new_applications.csv
+
+# 迭代对比：两次 run 的模型指标 / 过拟合 gap / 策略结果 diff
+python compare_runs.py reports/run_old reports/run_new --output diff.csv
 ```
 
-输出每行的 `model_score`、`decision`（reject / review / approve）、命中的规则和使用的阈值。
+输出每行的 `model_score`（原始概率）、`calibrated_prob`（isotonic 校准后的预期坏账率）、
+`credit_score`（标准分，base 600 / PDO 20，越高越安全）、`decision`（reject / review / approve）、
+命中的规则和使用的阈值。
 打分使用训练时保存的 WOE 编码器（缺失值独立分箱）、最优模型（XGB 优先加载原生
 `model_xgb.json`）和 `strategy/policy.json` 中的策略（全局阈值 + 分客群阈值 + 稳定拒绝规则）。
 
@@ -117,6 +131,7 @@ PSI ≥ 0.25 或缺失率漂移 > 10pp 会在日志中告警，明细写入 `<ou
 run_xxx/
 ├── run_summary.json           # 运行汇总（模型指标、规则数、生效配置快照）
 ├── dashboard.html             # 可视化报告
+├── run.log                    # 本次运行完整日志
 ├── split_train/test/valid.csv
 ├── eda/
 │   ├── iv_ranking.png         # IV 排名图
@@ -126,7 +141,9 @@ run_xxx/
 │   ├── model_lr.pkl           # LR 模型
 │   ├── model_xgb.pkl / .json  # XGBoost 模型（pickle + 原生 JSON）
 │   ├── model_meta.json        # 打分元数据（特征列表、最优算法、依赖版本）
-│   ├── woe_encoder.pkl        # WOE 编码器（含训练集中位数）
+│   ├── woe_encoder.pkl        # WOE 编码器（缺失值独立分箱）
+│   ├── calibrator.pkl         # isotonic 概率校准器（test 集拟合）
+│   ├── calibration_report.csv # 校准前后 vs 实际坏账率对比
 │   ├── scorecard_lr.csv       # 标准评分卡
 │   ├── model_comparison.csv   # 模型对比指标
 │   ├── xgb_shap.png           # SHAP 特征解释图

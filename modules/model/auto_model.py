@@ -27,6 +27,7 @@ from utils.helpers import (
     feature_psi_report,
     get_logger,
     model_report,
+    prob_to_score,
     save_pickle,
     score_bin_report,
 )
@@ -116,7 +117,8 @@ def build_scorecard(lr_model, woe_encoder: WOEEncoder, feature_cols: list, cfg: 
     base_score = cfg.get("base_score", 600)
     base_odds = cfg.get("base_odds", 1 / 15)
     factor = pdo / np.log(2)
-    offset = base_score - factor * np.log(base_odds)
+    # total card score equals base_score exactly when odds_bad == base_odds
+    offset = base_score + factor * np.log(base_odds)
     clf = lr_model.named_steps["lr"] if hasattr(lr_model, "named_steps") else lr_model
     coefs = dict(zip(feature_cols, clf.coef_[0]))
     intercept = clf.intercept_[0]
@@ -217,6 +219,7 @@ class AutoModel:
         self.feature_cols = []
         self.xgb_feature_cols = []
         self.xgb_monotone_constraints = None
+        self.calibrator = None
         self.label_col = ""
         self.best_algo = None
         self.scorecard = None
@@ -438,7 +441,22 @@ class AutoModel:
         if best_model is None:
             return {}
         save_full = REPORT_CONFIG.get("save_scored_full", False)
+
+        # Isotonic calibration fitted on TEST (train would overfit, valid stays sealed);
+        # calibrated_prob is the reportable expected bad rate. Raw model_score keeps
+        # driving strategy thresholds so quantile cuts stay well-defined.
+        test_prob = self._score_probs.get((self.best_algo, "test"))
+        if test_prob is not None:
+            from sklearn.isotonic import IsotonicRegression
+
+            self.calibrator = IsotonicRegression(
+                y_min=0.0, y_max=1.0, out_of_bounds="clip"
+            ).fit(test_prob, test_df[label_col].values)
+            save_pickle(self.calibrator, f"{report_dir}/calibrator.pkl")
+
+        scorecard_cfg = self.cfg.get("scorecard", {})
         scored = {}
+        calibration_rows = []
         for name, df in [("train", train_df), ("test", test_df), ("valid", valid_df)]:
             df_out = df.copy()
             X = df_out[self.feature_cols]
@@ -449,14 +467,46 @@ class AutoModel:
                 prob = best_model.predict_proba(self._prep_xgb_features(X))[:, 1]
             df_out["model_score"] = prob
             df_out["model_score_bin"] = pd.qcut(prob, q=10, labels=False, duplicates="drop")
+            if self.calibrator is not None:
+                df_out["calibrated_prob"] = self.calibrator.predict(prob)
+            df_out["credit_score"] = prob_to_score(
+                prob,
+                pdo=scorecard_cfg.get("pdo", 20),
+                base_score=scorecard_cfg.get("base_score", 600),
+                base_odds=scorecard_cfg.get("base_odds", 1 / 15),
+            )
+            calibration_rows.append(self._calibration_report(df_out, label_col, name))
             if save_full:
                 df_out.to_csv(f"{report_dir}/scored_{name}.csv", index=False)
             else:
-                df_out[[label_col, "model_score", "model_score_bin"]].to_csv(
-                    f"{report_dir}/scored_{name}.csv", index=False
-                )
+                slim_cols = [label_col, "model_score", "model_score_bin", "credit_score"]
+                if "calibrated_prob" in df_out.columns:
+                    slim_cols.insert(3, "calibrated_prob")
+                df_out[slim_cols].to_csv(f"{report_dir}/scored_{name}.csv", index=False)
             scored[name] = df_out
+        calib = pd.concat([c for c in calibration_rows if len(c)], ignore_index=True)
+        if len(calib):
+            calib.to_csv(f"{report_dir}/calibration_report.csv", index=False)
         return scored
+
+    def _calibration_report(self, df_out, label_col, dataset_name, n_bins: int = 10) -> pd.DataFrame:
+        """Per-decile raw vs calibrated probability vs actual bad rate."""
+        if "calibrated_prob" not in df_out.columns:
+            return pd.DataFrame()
+        tmp = df_out[[label_col, "model_score", "calibrated_prob"]].copy()
+        tmp["decile"] = pd.qcut(tmp["model_score"], q=n_bins, labels=False, duplicates="drop")
+        report = tmp.groupby("decile").agg(
+            count=(label_col, "size"),
+            raw_prob_mean=("model_score", "mean"),
+            calibrated_prob_mean=("calibrated_prob", "mean"),
+            actual_bad_rate=(label_col, "mean"),
+        ).reset_index()
+        report["dataset"] = dataset_name
+        report["raw_abs_error"] = (report["raw_prob_mean"] - report["actual_bad_rate"]).abs().round(6)
+        report["calibrated_abs_error"] = (
+            report["calibrated_prob_mean"] - report["actual_bad_rate"]
+        ).abs().round(6)
+        return report.round(6)
 
     def _drift_baseline(self, train_df: pd.DataFrame, bins: int = 10) -> dict:
         """Per-feature train distribution (quantile bins + missing rate) for scoring-time PSI."""
@@ -491,6 +541,8 @@ class AutoModel:
             "xgb_feature_cols": self.xgb_feature_cols,
             "xgb_monotone_constraints": list(self.xgb_monotone_constraints)
             if self.xgb_monotone_constraints is not None else None,
+            "calibration": "isotonic(test)" if self.calibrator is not None else None,
+            "scorecard": self.cfg.get("scorecard", {}),
             "versions": {
                 "pandas": pd.__version__,
                 "numpy": np.__version__,

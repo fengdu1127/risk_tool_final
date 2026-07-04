@@ -1,5 +1,6 @@
 """End-to-end entrypoint for risk modeling, validation, and rule mining."""
 import argparse
+import logging
 import os
 import sys
 
@@ -42,6 +43,26 @@ def run_pipeline(
     strategy_dir = f"{output_dir}/strategy"
     os.makedirs(output_dir, exist_ok=True)
 
+    # mirror all module logs (they propagate to root) into the run directory
+    file_handler = logging.FileHandler(f"{output_dir}/run.log", encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(name)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logging.getLogger().addHandler(file_handler)
+    try:
+        return _run_pipeline_inner(
+            data_path, label_col, algo, tune, feature_cols,
+            output_dir, eda_dir, model_dir, strategy_dir, time_col, valid_months, ts,
+        )
+    finally:
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
+
+
+def _run_pipeline_inner(
+    data_path, label_col, algo, tune, feature_cols,
+    output_dir, eda_dir, model_dir, strategy_dir, time_col, valid_months, ts,
+):
     logger.info("=" * 60)
     logger.info("risk modeling pipeline started")
     logger.info(f"output_dir={output_dir}")

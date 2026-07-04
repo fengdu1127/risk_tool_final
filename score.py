@@ -14,9 +14,27 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 
 from modules.strategy.auto_strategy import evaluate_rule_mask
-from utils.helpers import get_logger, load_pickle
+from utils.helpers import get_logger, load_pickle, prob_to_score
 
 logger = get_logger("SCORE")
+
+PRODUCTION_POINTER = os.path.join("reports", "PRODUCTION")
+
+
+def resolve_run_dir(run_dir: str = None) -> str:
+    """Explicit --run-dir wins; otherwise fall back to the reports/PRODUCTION pointer."""
+    if run_dir:
+        return run_dir
+    if os.path.exists(PRODUCTION_POINTER):
+        with open(PRODUCTION_POINTER, "r", encoding="utf-8") as f:
+            pointed = f.read().strip()
+        if pointed:
+            logger.info(f"using production run from {PRODUCTION_POINTER}: {pointed}")
+            return pointed
+    raise ValueError(
+        "no --run-dir given and reports/PRODUCTION does not exist; "
+        "promote a run first: python promote.py reports/run_xxx"
+    )
 
 
 def load_artifacts(run_dir: str) -> dict:
@@ -48,6 +66,11 @@ def load_artifacts(run_dir: str) -> dict:
 
     encoder = load_pickle(os.path.join(model_dir, "woe_encoder.pkl"))
 
+    calibrator = None
+    calibrator_path = os.path.join(model_dir, "calibrator.pkl")
+    if os.path.exists(calibrator_path):
+        calibrator = load_pickle(calibrator_path)
+
     policy = None
     policy_path = os.path.join(strategy_dir, "policy.json")
     if os.path.exists(policy_path):
@@ -56,7 +79,7 @@ def load_artifacts(run_dir: str) -> dict:
     else:
         logger.warning("policy.json not found; output will contain scores only, no decisions")
 
-    return {"meta": meta, "model": model, "encoder": encoder, "policy": policy}
+    return {"meta": meta, "model": model, "encoder": encoder, "calibrator": calibrator, "policy": policy}
 
 
 def build_features(df: pd.DataFrame, meta: dict, encoder) -> pd.DataFrame:
@@ -158,6 +181,7 @@ def apply_policy(df: pd.DataFrame, scores: np.ndarray, policy: dict) -> pd.DataF
 
 
 def run_scoring(run_dir: str, data_path: str, output_path: str = None, id_col: str = None) -> pd.DataFrame:
+    run_dir = resolve_run_dir(run_dir)
     artifacts = load_artifacts(run_dir)
     df = pd.read_csv(data_path)
     logger.info(f"scoring {len(df)} rows with model from {run_dir} (best_algo={artifacts['meta']['best_algo']})")
@@ -182,6 +206,16 @@ def run_scoring(run_dir: str, data_path: str, output_path: str = None, id_col: s
     scores = artifacts["model"].predict_proba(X)[:, 1]
     result = apply_policy(df, scores, artifacts["policy"])
 
+    if artifacts["calibrator"] is not None:
+        result.insert(1, "calibrated_prob", artifacts["calibrator"].predict(scores))
+    scorecard = artifacts["meta"].get("scorecard") or {}
+    result.insert(1, "credit_score", np.round(prob_to_score(
+        scores,
+        pdo=scorecard.get("pdo", 20),
+        base_score=scorecard.get("base_score", 600),
+        base_odds=scorecard.get("base_odds", 1 / 15),
+    ), 1))
+
     if id_col and id_col in df.columns:
         result.insert(0, id_col, df[id_col].values)
 
@@ -202,7 +236,7 @@ def run_scoring(run_dir: str, data_path: str, output_path: str = None, id_col: s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Score new data with a trained pipeline run")
-    parser.add_argument("--run-dir", required=True, help="Pipeline output directory, e.g. reports/run_xxx")
+    parser.add_argument("--run-dir", default=None, help="Pipeline output directory (default: reports/PRODUCTION pointer)")
     parser.add_argument("--data", required=True, help="CSV with the same feature columns used in training")
     parser.add_argument("--output", default=None, help="Output CSV path (default: scored_output.csv next to input)")
     parser.add_argument("--id-col", default=None, help="Optional ID column to carry into the output")

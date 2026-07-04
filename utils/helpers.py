@@ -206,6 +206,20 @@ def calc_lift(y_true: np.ndarray, y_pred_flag: np.ndarray) -> float:
     return float(y_true[mask].mean() / overall_bad_rate)
 
 
+def prob_to_score(prob, pdo: float = 20, base_score: float = 600, base_odds: float = 1 / 15):
+    """Map bad-probability to a standard credit score scale (higher = safer).
+
+    Consistent with the LR scorecard: score = base_score at odds_bad == base_odds,
+    and every PDO points doubles the good:bad odds.
+    """
+    prob = np.clip(np.asarray(prob, dtype=float), 1e-6, 1 - 1e-6)
+    factor = pdo / np.log(2)
+    # score = base_score exactly when odds_bad == base_odds
+    offset = base_score + factor * np.log(base_odds)
+    odds_bad = prob / (1 - prob)
+    return offset - factor * np.log(odds_bad)
+
+
 def model_report(y_true, y_prob, dataset_name: str = "") -> dict:
     auc = calc_auc(y_true, y_prob)
     ks = calc_ks(y_true, y_prob)

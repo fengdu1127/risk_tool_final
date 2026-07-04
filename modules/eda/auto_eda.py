@@ -123,7 +123,7 @@ class AutoEDA:
         """
         os.makedirs(report_dir, exist_ok=True)
         logger.info("=" * 50)
-        logger.info("开始 Auto-EDA 分析")
+        logger.info("Auto-EDA started")
         logger.info("=" * 50)
 
         feature_cols = [c for c in df.columns if c != label_col and c != time_col]
@@ -172,12 +172,12 @@ class AutoEDA:
 
         # 9. 输出汇总报告
         self._print_summary(summary)
-        logger.info(f"EDA 完成，图表已保存至 {report_dir}")
+        logger.info(f"EDA complete; reports saved to {report_dir}")
         return self.results
 
     # ----------------------------------------------------------
     def _data_quality(self, df: pd.DataFrame, label_col: str) -> pd.DataFrame:
-        logger.info("► 数据质量检测...")
+        logger.info("- data quality checks ...")
         rows = []
         for col in df.columns:
             missing_cnt = df[col].isna().sum()
@@ -195,12 +195,12 @@ class AutoEDA:
         qdf = pd.DataFrame(rows)
         high_missing = qdf[qdf["is_high_missing"]]["feature"].tolist()
         if high_missing:
-            logger.warning(f"高缺失率变量（>{self.cfg['missing_threshold']*100}%）: {high_missing}")
+            logger.warning(f"high-missing features (>{self.cfg['missing_threshold']*100}%): {high_missing}")
         return qdf
 
     # ----------------------------------------------------------
     def _iv_analysis(self, df, label_col, feature_cols):
-        logger.info("► 计算 IV / WOE ...")
+        logger.info("- computing IV / WOE ...")
         iv_rows = []
         woe_tables = {}
         # Include both numeric and categorical features (nunique > 1)
@@ -220,7 +220,7 @@ class AutoEDA:
                     "IV_label": classify_iv(iv),
                 })
             except Exception as e:
-                logger.warning(f"  {col} IV 计算失败: {e}")
+                logger.warning(f"  IV calculation failed for {col}: {e}")
 
         iv_table = pd.DataFrame(iv_rows).sort_values("IV", ascending=False)
         return iv_table, woe_tables
@@ -267,7 +267,7 @@ class AutoEDA:
 
     # ----------------------------------------------------------
     def _monotonicity(self, woe_tables: dict) -> dict:
-        logger.info("► 单调性检验 ...")
+        logger.info("- monotonicity checks ...")
         min_spearman = self.cfg.get("monotone_spearman_min", 0.6)
         res = {}
         for feat, woe_df in woe_tables.items():
@@ -278,7 +278,7 @@ class AutoEDA:
 
     # ----------------------------------------------------------
     def _correlation(self, df, feature_cols):
-        logger.info("► 相关性分析 ...")
+        logger.info("- correlation analysis ...")
         num_cols = [c for c in feature_cols
                     if df[c].dtype in [np.float64, np.int64, float, int]]
         corr = df[num_cols].corr(method="spearman")
@@ -295,12 +295,12 @@ class AutoEDA:
                         "correlation": round(corr.iloc[i, j], 4),
                     })
         if high_corr_pairs:
-            logger.warning(f"发现 {len(high_corr_pairs)} 对高相关变量对（阈值={threshold}）")
+            logger.warning(f"found {len(high_corr_pairs)} highly correlated pairs (threshold={threshold})")
         return corr, high_corr_pairs
 
     # ----------------------------------------------------------
     def _vif(self, df, feature_cols) -> pd.DataFrame:
-        logger.info("► VIF 计算 ...")
+        logger.info("- VIF computation ...")
         num_cols = [c for c in feature_cols
                     if df[c].dtype in [np.float64, np.int64, float, int]]
         sub = df[num_cols].dropna()
@@ -314,20 +314,20 @@ class AutoEDA:
             vif_data["high_vif"] = vif_data["VIF"] > self.cfg["vif_threshold"]
             return vif_data.sort_values("VIF", ascending=False)
         except Exception as e:
-            logger.warning(f"VIF 计算失败: {e}")
+            logger.warning(f"VIF computation failed: {e}")
             return pd.DataFrame()
 
     # ----------------------------------------------------------
     def _psi_internal(self, df, label_col, feature_cols, time_col: str = None) -> pd.DataFrame:
         """特征 PSI：有时间列时按时间前后二分（检测真实漂移），否则随机二分兜底"""
-        logger.info("► PSI 稳定性计算 ...")
+        logger.info("- PSI stability ...")
         if time_col and time_col in df.columns:
             times = pd.to_datetime(df[time_col], errors="coerce")
             df_ordered = df.loc[times.sort_values(kind="stable").index]
-            logger.info(f"  按时间列 '{time_col}' 前后二分计算 PSI")
+            logger.info(f"  time-ordered split by '{time_col}' for PSI")
         else:
             df_ordered = df.sample(frac=1.0, random_state=42)
-            logger.info("  无时间列，随机二分计算 PSI（仅作参考，检测不到时序漂移）")
+            logger.info("  no time column; random-split PSI (reference only, cannot detect temporal drift)")
         mid = len(df_ordered) // 2
         df1, df2 = df_ordered.iloc[:mid], df_ordered.iloc[mid:]
         psi_stable = self.cfg.get("psi_stable", 0.1)
@@ -459,7 +459,7 @@ class AutoEDA:
 
     def _print_summary(self, summary: pd.DataFrame):
         logger.info("\n" + "=" * 60)
-        logger.info("特征综合评估汇总（Top 20）")
+        logger.info("feature assessment summary (top 20)")
         logger.info("=" * 60)
         cols = ["feature", "IV", "IV_label", "is_monotone", "PSI",
                 "high_corr", "recommendation"]

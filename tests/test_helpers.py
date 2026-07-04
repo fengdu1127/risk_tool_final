@@ -186,3 +186,29 @@ class TestScoreBins:
         assert not report["raw_bad_rate"].is_monotonic_decreasing
         assert report["monotone_bad_rate"].is_monotonic_decreasing
         assert report["bad_rate_monotone"].all()
+
+
+class TestProbToScore:
+    def test_base_point(self):
+        from utils.helpers import prob_to_score
+        # odds_bad = 1/15  <=>  p = 1/16; score should equal base_score
+        assert abs(prob_to_score(1 / 16, pdo=20, base_score=600, base_odds=1 / 15) - 600) < 1e-6
+
+    def test_monotone_decreasing_in_risk(self):
+        from utils.helpers import prob_to_score
+        probs = np.linspace(0.01, 0.99, 50)
+        scores = prob_to_score(probs)
+        assert all(np.diff(scores) < 0)
+
+    def test_pdo_doubles_odds(self):
+        from utils.helpers import prob_to_score
+        # halving bad odds should add exactly PDO points
+        p1, p2 = 2 / 17, 1 / 16  # odds 2/15 vs 1/15
+        s1 = prob_to_score(p1, pdo=20)
+        s2 = prob_to_score(p2, pdo=20)
+        assert abs((s2 - s1) - 20) < 1e-6
+
+    def test_extreme_probs_clipped(self):
+        from utils.helpers import prob_to_score
+        scores = prob_to_score(np.array([0.0, 1.0]))
+        assert np.isfinite(scores).all()
