@@ -32,6 +32,12 @@ risk_tool/
 pip install -r requirements.txt
 ```
 
+### 生成示例数据（首次运行）
+
+```bash
+python data/generate_sample.py   # 固定随机种子，生成 data/sample.csv
+```
+
 ### 运行完整流程
 
 ```bash

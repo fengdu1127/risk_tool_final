@@ -17,6 +17,7 @@ Thumbs.db
 
 *.log
 
-reports/*
-!reports/run_bins_monotone_check_v2/
-!reports/run_bins_monotone_check_v2/**
+reports/
+
+# reproducible via data/generate_sample.py (fixed seed)
+data/sample.csv
