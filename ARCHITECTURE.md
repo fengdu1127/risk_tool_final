@@ -1,177 +1,113 @@
-# 风控自动化分析平台 — 代码框架
+# 风控自动化分析平台 — 项目框架
 
-## 1. 项目目录结构
+> 训练分析 → 版本对比 → 上线 → 打分决策 + 漂移监控 的完整闭环。
+
+## 1. 目录结构
 
 ```
 risk_tool_final/
-├── pipeline.py                 # 主入口，编排全流程
-├── requirements.txt            # 依赖
-├── ARCHITECTURE.md             # 本文件
+├── pipeline.py                 # 训练入口：EDA → 双模型 → 策略挖掘 → 报告
+├── score.py                    # 打分入口：模型 + 校准 + 策略决策 + 漂移检查
+├── promote.py                  # 上线：把某次 run 写入 reports/PRODUCTION 指针
+├── compare_runs.py             # 迭代：两次 run 的指标/策略 diff
+├── requirements.txt            # 锁定版本（与模型产物兼容性绑定）
+├── pytest.ini
 ├── config/
-│   ├── __init__.py
-│   └── config.py               # 全局配置（4个字典控制所有阈值）
+│   └── config.py               # 5 个配置字典 + JSON 覆盖 + 快照
 ├── data/
-│   ├── generate_sample.py      # 生成模拟数据
-│   └── sample.csv
+│   └── generate_sample.py      # 固定种子生成 data/sample.csv（不入库）
 ├── modules/
-│   ├── __init__.py
-│   ├── eda/
-│   │   ├── __init__.py
-│   │   └── auto_eda.py         # 模块一：探索性数据分析
-│   ├── model/
-│   │   ├── __init__.py
-│   │   └── auto_model.py       # 模块二：模型训练（LR + XGBoost）
-│   └── strategy/
-│       ├── __init__.py
-│       └── auto_strategy.py    # 模块三：策略规则挖掘
+│   ├── eda/auto_eda.py         # 模块一：数据质量 / WOE·IV / 单调性 / 相关性 / VIF / PSI
+│   ├── model/auto_model.py     # 模块二：WOE 编码 / LR+XGB / 调优 / 校准 / 评分刻度
+│   ├── strategy/auto_strategy.py  # 模块三：变量筛选 / 规则挖掘 / 三集回测 / policy.json
+│   └── reporting/dashboard.py  # 静态 HTML 可视化报告
 ├── utils/
-│   ├── __init__.py
-│   └── helpers.py              # 公共工具（划分/指标/持久化/校验）
-└── tests/
-    ├── __init__.py
-    ├── test_eda.py
-    ├── test_helpers.py
-    ├── test_model.py
-    └── test_strategy.py
+│   ├── binning.py              # 统一分箱：决策树切点 + WOE 统计（EDA/模型共用）
+│   └── helpers.py              # 划分 / 指标 / prob_to_score / 持久化 / 校验
+└── tests/                      # 100 个测试（含 pipeline→score 端到端）
 ```
 
-## 2. 数据流
+## 2. 训练链路（pipeline.py）
 
 ```
-CSV 数据
+CSV ─ validate_inputs
   │
-  ├─ pipeline.run_pipeline()
+  ├─ [1] 数据划分
+  │      有 time_col：最近 N 月 → valid（近期验证），历史随机分层 → train/test
+  │      无 time_col：随机分层 70/15/15
   │
-  ├─ [0] 数据加载 & 校验 ── validate_inputs()
-  ├─ [1] 数据集划分 ── split_dataset() → train(70%) / test(15%) / holdout(15%)
+  ├─ [2] AutoEDA.run(train, time_col)
+  │      质量 → IV/WOE（缺失独立分箱）→ 单调性（阈值走配置，排除缺失箱）
+  │      → 相关性/VIF → PSI（有时间列按时间前后二分）→ 综合建议
+  │      └→ iv_table ────────────────────────────┐
+  │                                              │
+  ├─ [3] AutoModel.run                           │
+  │      WOEEncoder 一次拟合（train），LR 全特征 WOE，XGB 数值原值+类别 WOE
+  │      ├─ LR：Pipeline(Scaler+LR)，Optuna CV 调优（无泄漏）
+  │      ├─ XGB：单调性约束（Spearman 自动定向），调参只用 train 内部 8/2 切分
+  │      ├─ 按 test KS 选最优 → isotonic 校准（test 拟合）
+  │      ├─ 产物：model_*.pkl/.json、woe_encoder、calibrator、model_meta.json
+  │      │        （特征列表、约束、漂移基线、依赖版本）、scorecard、calibration_report
+  │      └→ scored train/test/valid（model_score + calibrated_prob + credit_score）
+  │                                              │
+  ├─ [4] AutoStrategy.run  ←─────────────────────┘
+  │      变量筛选（相关/单调/PSI）→ 单维规则 + 决策树规则 → 重叠去重
+  │      → 三集回测 → 稳定规则 → 全局/分客群阈值网格搜索 → 三档推荐
+  │      └→ policy.json（score.py 直接消费的机器可读策略）
   │
-  ├─ [2] 模块一: AutoEDA.run()
-  │        ├─ 数据质量检测
-  │        ├─ WOE/IV 计算 (calc_woe_iv)
-  │        ├─ WOE 单调性检验 (check_monotonicity)
-  │        ├─ 相关性矩阵 & 高相关检出
-  │        ├─ VIF 多重共线性
-  │        ├─ PSI 稳定性
-  │        └─ 综合评分汇总 (_feature_summary)
-  │        │
-  │        └──→ iv_table ──────────────────────────┐
-  │                                                 │
-  ├─ [3] 模块二: AutoModel.run()                    │
-  │        ├─ WOEEncoder (LR用)                     │
-  │        ├─ _train_lr() → LogisticRegression      │
-  │        │   ├─ Optuna 超参调优                    │
-  │        │   ├─ ROC/KS/Lift 图                     │
-  │        │   └─ 评分卡 (build_scorecard)           │
-  │        ├─ _train_xgboost() → XGBClassifier       │
-  │        │   ├─ Optuna 超参调优                    │
-  │        │   ├─ ROC/KS/Lift 图                     │
-  │        │   ├─ SHAP 特征重要性                    │
-  │        │   └─ XGBoost 特征重要性                 │
-  │        ├─ 模型对比 → 选最优 (按 test KS)         │
-  │        └─ _score_all() → 写回 model_score 列     │
-  │        │                                          │
-  │        └──→ scored_datasets ──────────────────┐  │
-  │                                                │  │
-  ├─ [4] 模块三: AutoStrategy.run()                │  │
-  │        ├─ VariableSelector.fit()  ←───────────┘  │
-  │        │   ├─ 高相关剔除 (数值型)                 │
-  │        │   ├─ WOE单调性筛选 (数值型)              │
-  │        │   ├─ PSI稳定性筛选 (数值型)              │
-  │        │   └─ 类别型: IV基础检查                  │
-  │        ├─ SingleRuleMiner.mine()                  │
-  │        │   ├─ 数值型: >= / <= 枚举切点            │
-  │        │   └─ 类别型: == 枚举类别值               │
-  │        ├─ TreeRuleMiner.mine()                    │
-  │        │   └─ DecisionTreeClassifier 叶节点规则    │
-  │        └─ StrategyBacktest.run() × 3              │
-  │           └─ 训练集/测试集/保留集 回测验证        │
-  │
-  └─ [5] 汇总 → run_summary.json
+  └─ [5] run_summary.json（含配置快照）→ dashboard.html → run.log
 ```
 
-## 3. 模块一: auto_eda.py — 探索性数据分析
+## 3. 部署链路（promote.py + score.py）
 
-| 函数/类 | 作用 |
+```
+python promote.py reports/run_xxx     # 校验产物齐全 → 写 reports/PRODUCTION
+python score.py --data new.csv        # 缺省读 PRODUCTION 指针
+
+score.py 内部：
+  漂移检查（新批次 vs 训练基线：逐特征 PSI + 缺失率漂移，超限告警 + *_drift.csv）
+  → WOE 特征工程（训练时的切点/缺失箱） → 模型打分
+  → calibrated_prob（预期坏账率） + credit_score（base 600 / PDO 20）
+  → 策略决策：稳定拒绝规则 OR 分数阈值（分客群阈值优先）
+  → 输出 decision（reject/review/approve）+ 命中规则 + 使用阈值
+```
+
+## 4. 模块职责
+
+| 文件 | 核心类/函数 | 职责 |
+|---|---|---|
+| `utils/binning.py` | `tree_bin_thresholds` / `woe_stats` | 全项目唯一分箱实现，保证 EDA/模型/策略切点一致 |
+| `modules/eda/auto_eda.py` | `AutoEDA`, `calc_woe_iv`, `check_monotonicity` | 特征体检与筛选建议；缺失单独成箱（bin=-1） |
+| `modules/model/auto_model.py` | `WOEEncoder`, `AutoModel`, `build_scorecard` | 双模型训练/调优/校准/持久化/漂移基线 |
+| `modules/strategy/auto_strategy.py` | `VariableSelector`, `SingleRuleMiner`, `TreeRuleMiner`, `StrategyBacktest`, `AutoStrategy` | 规则挖掘、三集稳定性验证、策略推荐与序列化 |
+| `modules/reporting/dashboard.py` | `generate_dashboard` | 汇总 CSV/PNG 为单页 HTML 报告 |
+| `utils/helpers.py` | `split_dataset*`, `calc_ks/auc/psi/lift`, `prob_to_score`, `validate_inputs` | 公共工具 |
+
+## 5. 配置系统（config/config.py）
+
+| 字典 | 管什么 |
 |---|---|
-| `calc_woe_iv()` | 单变量 WOE/IV 计算，支持 quantile/uniform/tree 三种分箱，自动识别类别型特征 |
-| `classify_iv()` | IV 值分级：无预测力/弱/中/强/极强 |
-| `check_monotonicity()` | WOE 单调性检验，返回 Spearman 相关系数 |
-| **`AutoEDA`** | 主类，`.run()` 一键执行全量 EDA |
-| `._data_quality()` | 缺失率、数据类型、唯一值统计 |
-| `._iv_analysis()` | 遍历所有特征计算 IV，返回排名表 |
-| `._monotonicity()` | 对所有 WOE 表做单调性检验 |
-| `._correlation()` | Spearman 相关矩阵，检出高相关对 (默认 >0.7) |
-| `._vif()` | 方差膨胀因子（仅数值型） |
-| `._psi_internal()` | 随机二分计算 PSI 稳定性 |
-| `._feature_summary()` | 综合多维度给出 OK/WARN 建议 |
-| 可视化 | `_plot_iv_bar` / `_plot_corr_heatmap` / `_plot_woe_trends` |
+| `SPLIT_CONFIG` | 划分比例、time_col、valid_months、随机种子 |
+| `EDA_CONFIG` | 缺失/IV/PSI/相关性/VIF 阈值、单调性阈值、分箱数 |
+| `MODEL_CONFIG` | 算法、CV、optuna 次数、缺失分箱最小样本、XGB 单调约束开关、评分卡刻度 |
+| `STRATEGY_CONFIG` | 规则覆盖率/Lift/稳定性约束、分客群网格与判别过滤 |
+| `REPORT_CONFIG` | 输出目录、图表参数、scored CSV 瘦身开关 |
 
-## 4. 模块二: auto_model.py — 模型开发
+- 运行时覆盖：`pipeline.py --config my.json`（`apply_config_overrides`，兼容 BOM）
+- 可复现：每次 run 的生效配置整体快照进 `run_summary.json["config"]`
 
-| 函数/类 | 作用 |
-|---|---|
-| **`WOEEncoder`** | 特征编码器，数值型用决策树分箱→WOE，类别型直接计算每类 WOE |
-| `.fit()` / `.transform()` | 训练/应用 WOE 映射，自动区分数值/类别 |
-| `build_scorecard()` | LR 系数 + WOE → 标准评分卡 (pdo=20, base=600, odds=1/15) |
-| `plot_roc_ks()` | 双图：ROC 曲线 + KS 曲线 |
-| `plot_lift_curve()` | 双图：分箱 Bad Rate + Lift 曲线 |
-| `plot_shap_summary()` | SHAP 摘要图 + CSV 输出（兼容 XGBoost 3.x） |
-| **`AutoModel`** | 主类，`.run()` 一键训练和评估 |
-| `._train_lr()` | WOE编码 → StandardScaler → LogisticRegression → ROC/KS/Lift 评估 |
-| `._train_xgboost()` | 仅数值列 → XGBClassifier (自动 scale_pos_weight) → 评估 + SHAP |
-| `._tune_lr()` / `._tune_xgb()` | Optuna 贝叶斯超参搜索 (CV AUC) |
-| `._score_all()` | 最优模型评分写回各数据集 (model_score + model_score_bin) |
+## 6. 方法论保障
 
-## 5. 模块三: auto_strategy.py — 策略引擎
+- **无泄漏调参**：LR 用训练集 CV，XGB 只用 train 内部切分；test 仅用于模型选择与校准，valid 全程封存到最终验证
+- **训练/上线一致**：WOE 切点、缺失箱、训练中位数全部持久化在编码器里；打分不依赖当前批次统计量
+- **可解释性**：XGB 单调性约束方向自动推导并记录；LR 评分卡与 `prob_to_score` 同一刻度（base 600 / PDO 20）
+- **概率可信**：isotonic 校准修正 `scale_pos_weight` 带来的概率偏移，calibration_report 留痕
+- **上线监控**：训练分布基线存 `model_meta.json`，每次打分自动 PSI + 缺失率漂移检查
+- **规则防过拟合**：覆盖率/Lift/命中数三集全过 + test-valid Lift 回撤约束才算稳定规则
 
-| 类 | 作用 |
-|---|---|
-| **`VariableSelector`** | 三步预筛选：高相关 → 单调性 → PSI，数值型全流程，类别型仅 IV 检查 |
-| `._drop_high_corr()` | Spearman 相关 > 阈值 → 保留 IV 高者 |
-| `._filter_monotone()` | WOE Spearman < 0.6 → 剔除 |
-| `._filter_stable()` | PSI > 0.1 → 剔除 |
-| **`SingleRuleMiner`** | 单维规则挖掘：覆盖率 ≤ 5%，Lift ≥ 2 |
-| `.mine()` | 数值型枚举百分位切点 (>= / <=)，类别型枚举值 (==) |
-| **`TreeRuleMiner`** | 决策树组合规则：max_depth=3, max_features=3 |
-| `.mine()` | 仅数值型 → DecisionTreeClassifier → 提取叶节点条件路径 |
-| `._extract_leaf_rules()` | 递归遍历树，筛选满足覆盖率/Lift 约束的叶节点 |
-| `.plot_tree()` | 决策树可视化 |
-| **`StrategyBacktest`** | 规则回测验证 |
-| `.run()` | 逐规则计算覆盖率/逾期率/Lift，三数据集验证 |
-| `.combined_effect()` | 所有规则 OR 合并的整体拒绝率 |
-| **`AutoStrategy`** | 主类，`.run()` 一键执行全流程 |
-| `._merge_rules()` | 合并单维 + 树规则为统一格式 |
-| 可视化 | `_plot_rule_comparison` / `_plot_coverage_lift` |
+## 7. 质量与运维
 
-## 6. 配置系统: config.py
-
-4 个字典集中控制所有超参数：
-
-| 字典 | 关键参数 |
-|---|---|
-| `SPLIT_CONFIG` | train/test/holdout 比例 70/15/15，随机种子 42 |
-| `EDA_CONFIG` | missing_threshold=0.5, iv_min=0.02, corr_threshold=0.7, psi_stable=0.1 |
-| `MODEL_CONFIG` | cv=5, optuna_trials=50, LR/XGB 默认参数, scorecard (pdo=20) |
-| `STRATEGY_CONFIG` | corr=0.7, monotone_spearman_min=0.6, psi_max=0.1, coverage≤5%, lift≥2, tree_depth=3 |
-
-## 7. 公共工具: helpers.py
-
-| 函数 | 作用 |
-|---|---|
-| `get_logger()` | 统一日志格式 |
-| `split_dataset()` | 按时间或随机分层 (stratify) 划分 |
-| `calc_ks()` | KS = max(TPR - FPR) |
-| `calc_auc()` | ROC AUC |
-| `calc_psi()` | 群体稳定性指标 |
-| `calc_lift()` | bad_rate / overall_bad_rate |
-| `model_report()` | 一键输出 AUC/KS/Gini |
-| `save_pickle()` / `load_pickle()` / `save_json()` | 持久化 |
-| `validate_inputs()` | 输入校验：样本量/标签分布/特征存在性/零方差 |
-
-## 8. 关键设计特点
-
-- **数值/类别双轨**: WOE 编码和规则挖掘均自动识别特征类型，数值型走分箱/切点枚举，类别型走直接映射/值枚举
-- **兼容性处理**: SHAP 使用 `shap.Explainer(model.predict, background)` 规避 XGBoost 3.x 的 `base_score` 格式问题；Windows GBK 控制台使用 ASCII 替代 emoji
-- **XGBoost 仅数值输入**: 自动过滤非数值列，`scale_pos_weight` 从标签分布自动计算
-- **封存验证**: holdout 集在策略阶段才首次使用，防止过拟合
-- **输出目录结构**: `reports/run_{timestamp}/` → `eda/` `model/` `strategy/` 三级子目录，含 CSV + PNG 图表
+- 测试：`python -m pytest tests/`（100 个，含端到端；`slow` 标记训练类用例）
+- 日志：控制台 + `<run>/run.log` 全量镜像
+- 版本管理：`compare_runs.py` diff 两次 run；`promote.py` 维护生产指针
+- 产物兼容：requirements 锁定版本，与 `model_meta.json` 记录的训练环境一致
