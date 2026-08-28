@@ -31,14 +31,36 @@ class BinningError(ValueError):
     """A feature cannot be binned (constant, all-missing, too few levels)."""
 
 
+def canonical(value) -> str | None:
+    """Map one categorical value to the key it is stored under. None for nulls.
+
+    Plain `str()` is not enough. A column of small integers is read back as
+    float64 the moment any row is missing, so a level stored as ``"12"`` during
+    training arrives as ``"12.0"`` at scoring time and silently becomes an
+    unseen category. Collapsing integral floats onto the integer spelling makes
+    the key survive that round trip, which is the difference between a level
+    keeping its fitted WOE and quietly falling through to the pooled bucket.
+    """
+    if value is None or (not isinstance(value, (list, tuple, np.ndarray)) and pd.isna(value)):
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return str(int(number)) if number.is_integer() else repr(number)
+    return str(value)
+
+
 def as_text(values) -> list[str | None]:
-    """Normalise a categorical column to strings, with every flavour of null as None.
+    """Normalise a categorical column to canonical keys, nulls as None.
 
     pandas has several null sentinels (None, NaN, NA, NaT) and which one survives
     a given operation varies by version and dtype; collapsing them here keeps the
-    rest of the binning code from having to care.
+    rest of the codebase from having to care.
     """
-    return [None if v is None or pd.isna(v) else str(v) for v in pd.Series(values).tolist()]
+    return [canonical(v) for v in pd.Series(values).tolist()]
 
 
 @dataclass(frozen=True)
@@ -197,6 +219,7 @@ def fit_numeric(
     target = pd.Series(y).reset_index(drop=True).astype(float)
     if len(x) != len(target):
         raise BinningError(f"{feature}: values and labels differ in length")
+    _require_both_classes(target, feature)
 
     present = x.notna().to_numpy()
     x_present = x.to_numpy(dtype=float)[present]
@@ -260,6 +283,7 @@ def fit_categorical(
     target = pd.Series(y).reset_index(drop=True).astype(float)
     if len(series) != len(target):
         raise BinningError(f"{feature}: values and labels differ in length")
+    _require_both_classes(target, feature)
 
     text = as_text(series)
     present = np.array([v is not None for v in text])
@@ -331,6 +355,20 @@ def fit_binning(values, y, kind: str, settings: BinningSettings, feature: str) -
 # --------------------------------------------------------------------------- #
 # internals
 # --------------------------------------------------------------------------- #
+
+
+def _require_both_classes(target: pd.Series, feature: str) -> None:
+    """WOE is undefined against a single class.
+
+    With no bads (or no goods) the smoothing floor is the only thing keeping the
+    log finite, and every bin ends up with the same fabricated share — which
+    yields an enormous, entirely meaningless IV. Refusing is the only honest
+    answer.
+    """
+    if target.dropna().nunique() < 2:
+        raise BinningError(
+            f"{feature}: the label has a single class, so weight of evidence is undefined"
+        )
 
 
 def _candidate_cuts(x: np.ndarray, y: np.ndarray, settings: BinningSettings) -> list[float]:

@@ -8,6 +8,7 @@ was trained last.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -93,6 +94,10 @@ class Registry:
 
     def new_run(self, name: str | None = None) -> Run:
         run_name = name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # A run name is a directory name, not a path. Anything else would put the
+        # run somewhere `list_runs` and the production pointer cannot see it.
+        if run_name != Path(run_name).name or run_name in {"", ".", ".."} or run_name == POINTER_FILENAME:
+            raise ValueError(f"invalid run name '{run_name}'; it must be a single directory name")
         path = self.root / run_name
         if path.exists():
             raise FileExistsError(f"run directory already exists: {path}")
@@ -124,7 +129,16 @@ class Registry:
         # Loading proves the bundle is readable before it becomes production.
         resolved.load_bundle()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.pointer_path.write_text(resolved.name + "\n", encoding="utf-8")
+        # Write to a sibling file and rename. os.replace is atomic, so a crash or
+        # a concurrent promotion leaves the pointer naming either the old run or
+        # the new one — never a truncated name, and never nothing at all while
+        # scoring is asking who production is.
+        staging = self.pointer_path.with_name(f".{POINTER_FILENAME}.{os.getpid()}")
+        try:
+            staging.write_text(resolved.name + "\n", encoding="utf-8")
+            os.replace(staging, self.pointer_path)
+        finally:
+            staging.unlink(missing_ok=True)
         log.info("promoted %s to production", resolved.name)
         return resolved
 

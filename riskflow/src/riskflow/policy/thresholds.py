@@ -17,6 +17,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from ..features.binning import as_text
 from ..logging_setup import get_logger
 from ..settings import CutoffSettings
 
@@ -57,10 +58,10 @@ class SegmentCutoff:
     def matches(self, df: pd.DataFrame) -> np.ndarray:
         if self.feature not in df.columns:
             return np.zeros(len(df), dtype=bool)
-        column = df[self.feature]
-        if self.value is None:
-            return column.isna().to_numpy()
-        return (column.notna() & (column.astype("object").astype(str) == self.value)).to_numpy()
+        # Canonical keys, so a segment identified as `term=12` during training
+        # still matches when the column arrives as float 12.0 at scoring time.
+        keys = as_text(df[self.feature])
+        return np.array([key == self.value for key in keys], dtype=bool)
 
     def to_dict(self) -> dict:
         return {"feature": self.feature, "value": self.value, "cutoff": self.cutoff.to_dict()}
@@ -240,8 +241,10 @@ def search_segment_cutoffs(
 
 
 def _segment_values(column: pd.Series) -> list[str | None]:
-    values: list[str | None] = [str(v) for v in pd.unique(column.dropna().astype("object").astype(str))]
-    if column.isna().any():
+    """Distinct segment keys, using the same canonical form matching uses."""
+    keys = as_text(column)
+    values: list[str | None] = sorted({k for k in keys if k is not None})
+    if any(k is None for k in keys):
         values.append(None)
     return values
 

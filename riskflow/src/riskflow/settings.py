@@ -214,6 +214,14 @@ def _coerce(value: Any, current: Any, key: str) -> Any:
         if not isinstance(value, bool):
             raise TypeError(f"setting '{key}' expects a boolean, got {type(value).__name__}")
         return value
-    if isinstance(current, int) and not isinstance(current, bool) and isinstance(value, bool):
-        raise TypeError(f"setting '{key}' expects a number, got bool")
+    if isinstance(current, int) and not isinstance(current, bool):
+        if isinstance(value, bool):
+            raise TypeError(f"setting '{key}' expects a number, got bool")
+        # JSON has no integer type, so 4.0 is a legitimate way to write 4 — but
+        # 3.7 is a mistake, and letting it through only surfaces much later as a
+        # baffling error from range() or an array index.
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise TypeError(f"setting '{key}' expects a whole number, got {value}")
+            return int(value)
     return value

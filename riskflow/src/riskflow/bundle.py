@@ -135,7 +135,24 @@ class ScoringBundle:
         if target.is_dir():
             target = target / BUNDLE_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(self.to_dict(), indent=2, default=_json_default), encoding="utf-8")
+
+        payload = self.to_dict()
+        # Descriptive metadata routinely carries NaN (a metric that could not be
+        # computed, an empty group's bad rate). Those become null rather than
+        # sinking the save.
+        payload["metadata"] = _drop_non_finite(payload.get("metadata", {}))
+        try:
+            # allow_nan=False: Python would happily emit bare NaN and Infinity,
+            # which no other JSON parser accepts. A bundle that only Python can
+            # read is not the portable artefact this format promises, so a
+            # non-finite model weight fails here rather than on someone else's
+            # loader months later.
+            text = json.dumps(payload, indent=2, default=_json_default, allow_nan=False)
+        except ValueError as exc:
+            raise ValueError(
+                f"refusing to write a bundle containing non-finite numbers: {exc}"
+            ) from exc
+        target.write_text(text, encoding="utf-8")
         log.info("saved scoring bundle to %s (%.1f KB)", target, target.stat().st_size / 1024)
         return target
 
@@ -147,6 +164,17 @@ class ScoringBundle:
         if not source.exists():
             raise FileNotFoundError(f"no scoring bundle at {source}")
         return cls.from_dict(json.loads(source.read_text(encoding="utf-8-sig")))
+
+
+def _drop_non_finite(value):
+    """Replace NaN and infinities with null, recursively."""
+    if isinstance(value, Mapping):
+        return {k: _drop_non_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_drop_non_finite(v) for v in value]
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    return value
 
 
 def _json_default(value):

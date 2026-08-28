@@ -43,11 +43,45 @@ class DecisionPolicy:
             segment[mask] = f"{override.feature}={override.value if override.value is not None else '__missing__'}"
         return reject_at, review_at, segment
 
+    def required_columns(self) -> tuple[str, ...]:
+        """Columns the policy itself needs, beyond the model's own inputs.
+
+        A rule or a segment override can reference a column the model never
+        used. If one of those is absent at scoring time the policy quietly
+        stops applying to those rows, so callers must be able to check for
+        them up front rather than discover it from a shifted decision mix.
+        """
+        needed: list[str] = []
+        for rule in self.reject_rules:
+            needed.extend(rule.features)
+        needed.extend(override.feature for override in self.segment_cutoffs)
+        seen: list[str] = []
+        for column in needed:
+            if column not in seen:
+                seen.append(column)
+        return tuple(seen)
+
     def decide(self, df: pd.DataFrame, scores) -> pd.DataFrame:
         """Apply the policy. A hard rule outranks the score bands."""
         score = np.asarray(pd.Series(scores).to_numpy(), dtype=float)
         if len(score) != len(df):
             raise ValueError(f"got {len(score)} scores for {len(df)} rows")
+        # A non-finite score compares false against every threshold, which would
+        # quietly approve the applicant. Failing open is the one outcome a
+        # credit decision must never have, so this is an error, not a default.
+        unusable = ~np.isfinite(score)
+        if unusable.any():
+            raise ValueError(
+                f"{int(unusable.sum())} of {len(score)} scores are not finite "
+                f"(first at row {int(np.argmax(unusable))}); refusing to decide on them"
+            )
+
+        missing = [c for c in self.required_columns() if c not in df.columns]
+        if missing:
+            raise KeyError(
+                f"the policy references column(s) absent from the data: {missing}; "
+                "without them its rules and segment overrides would silently stop applying"
+            )
 
         reject_at, review_at, segment = self.thresholds_for(df)
         rule_hit = first_hit_labels(self.reject_rules, df) if self.reject_rules else np.full(len(df), "", dtype=object)

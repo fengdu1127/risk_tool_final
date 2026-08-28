@@ -18,6 +18,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from ..features.binning import as_text, canonical
+
 COMPARISONS = {
     "lt": lambda x, v: x < v,
     "le": lambda x, v: x <= v,
@@ -44,6 +46,15 @@ class Predicate:
             raise ValueError(f"unknown operator '{self.op}'; expected one of {OPERATORS}")
         if self.op in MEMBERSHIPS and not isinstance(self.value, (list, tuple, set, frozenset)):
             raise ValueError(f"operator '{self.op}' needs a collection of values")
+        # Categorical values are normalised once, here, so that both the stored
+        # predicate and the column it is later evaluated against are expressed in
+        # the same keys. Without this a rule mined on an integer column stops
+        # firing the moment pandas reads that column back as float — silently,
+        # since a rule that matches nothing raises nothing.
+        if self.op in MEMBERSHIPS:
+            object.__setattr__(self, "value", tuple(canonical(v) for v in self.value))
+        elif self.op in ("eq", "ne"):
+            object.__setattr__(self, "value", canonical(self.value))
 
     def evaluate(self, df: pd.DataFrame) -> np.ndarray:
         if self.feature not in df.columns:
@@ -61,14 +72,14 @@ class Predicate:
                 hit = COMPARISONS[self.op](numbers, float(self.value))
             return np.where(np.isnan(numbers), False, hit)
 
-        as_text = column.astype("object").map(lambda v: None if pd.isna(v) else str(v)).to_numpy()
+        keys = as_text(column)
         if self.op == "eq":
-            return present & (as_text == str(self.value))
+            return np.array([k is not None and k == self.value for k in keys], dtype=bool)
         if self.op == "ne":
-            return present & (as_text != str(self.value))
-        wanted = {str(v) for v in self.value}
-        inside = np.array([v in wanted for v in as_text], dtype=bool)
-        return present & (inside if self.op == "in" else ~inside)
+            return np.array([k is not None and k != self.value for k in keys], dtype=bool)
+        wanted = set(self.value)
+        inside = np.array([k is not None and k in wanted for k in keys], dtype=bool)
+        return inside if self.op == "in" else (present & ~inside)
 
     def describe(self) -> str:
         if self.op in NULL_CHECKS:

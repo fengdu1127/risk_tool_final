@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from ..data.schema import DatasetSchema
+from ..features.binning import as_text
 from ..logging_setup import get_logger
 from ..settings import RuleSettings
 from .predicates import Predicate, Rule
@@ -61,8 +62,9 @@ def mine_single_rules(
                 rules.append(Rule((Predicate(feature, "ge", upper),), source="single"))
                 rules.append(Rule((Predicate(feature, "le", lower),), source="single"))
         else:
-            for level in column.dropna().astype(str).unique():
-                rules.append(Rule((Predicate(feature, "eq", str(level)),), source="single"))
+            # Canonical keys, matching how the predicate will compare them later.
+            for level in sorted({k for k in as_text(column) if k is not None}):
+                rules.append(Rule((Predicate(feature, "eq", level),), source="single"))
     return rules
 
 

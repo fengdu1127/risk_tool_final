@@ -27,6 +27,14 @@ def backtest(
     rules: Sequence[Rule], datasets: Mapping[str, pd.DataFrame], label: str
 ) -> pd.DataFrame:
     """Long-format performance of every rule on every sample."""
+    # Everything downstream keys on rule_id: the stability pivot would silently
+    # keep one of a colliding pair, and `select_stable` would then wave both
+    # through on a single rule's evidence.
+    identifiers = [rule.rule_id for rule in rules]
+    duplicates = sorted({i for i in identifiers if identifiers.count(i) > 1})
+    if duplicates:
+        raise ValueError(f"rule ids must be unique; repeated: {duplicates}")
+
     rows = []
     for name in DATASETS:
         if name not in datasets:
