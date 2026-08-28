@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .bundle import ScoringBundle
-from .data.schema import DatasetSchema, infer_schema, validate_frame
+from .data.schema import DatasetSchema, coerce_label, infer_schema, validate_frame
 from .data.splitting import split
 from .features.diagnostics import screen
 from .features.woe import WoeTransformer
@@ -82,6 +82,7 @@ def _train(
     source = "<dataframe>" if isinstance(data, pd.DataFrame) else str(data)
     log.info("training on %s | %d rows x %d columns", source, len(df), df.shape[1])
 
+    df = coerce_label(df, label)
     schema = infer_schema(df, label, features, settings.split.time_col, id_col)
     for message in validate_frame(df, schema):
         log.warning("input check: %s", message)

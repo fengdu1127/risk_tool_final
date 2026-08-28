@@ -295,3 +295,207 @@ def test_an_empty_pointer_is_reported_not_silently_ignored(tmp_path):
     registry.pointer_path.write_text("")
     with pytest.raises(ValueError, match="empty"):
         registry.production()
+
+
+# ---------------------------------------------------------------------------
+# Numerical resolution where it matters most: the risky tail
+# ---------------------------------------------------------------------------
+
+
+def test_the_credit_score_does_not_saturate_in_the_tail():
+    """Derived from the probability, the score flatlined past a log-odds of ~36.
+
+    float64 rounds sigmoid(36) to exactly 1.0, so every applicant beyond that
+    collapsed onto one score — destroying the ordering precisely across the
+    riskiest people, which is the ordering the score exists to provide.
+    """
+    from riskflow.models.predictors import LinearScorer
+    from riskflow.models.scorecard import ScorecardSettings, credit_score_from_log_odds, to_credit_score
+
+    settings = ScorecardSettings()
+    scorer = LinearScorer(features=("x",), coefficients=(1.0,), intercept=0.0)
+    frame = pd.DataFrame({"x": [0.0, 20.0, 36.0, 45.0, 60.0]})
+
+    from_margin = credit_score_from_log_odds(scorer.margin(frame), settings)
+    assert np.all(np.diff(from_margin) < 0), "the score must keep falling as risk rises"
+
+    # the probability route is where the resolution is lost
+    via_probability = to_credit_score(scorer.predict_proba(frame), settings)
+    assert via_probability[2] == pytest.approx(via_probability[4]), "documents the saturation"
+    assert from_margin[4] < from_margin[2] - 100
+
+
+def test_the_bundle_publishes_the_margin_s_score_not_the_probability_s(minimal_bundle):
+    """The published credit score must be the margin's affine image, exactly.
+
+    Saturation itself is covered above; what matters here is that the bundle
+    takes the margin route at all, rather than inverting its own probability.
+    """
+    from dataclasses import replace
+
+    from riskflow.models.predictors import LinearScorer
+    from riskflow.models.scorecard import credit_score_from_log_odds
+
+    bundle = replace(
+        minimal_bundle,
+        predictor=LinearScorer(features=("x",), coefficients=(60.0,), intercept=0.0),
+    )
+    frame = pd.DataFrame({"x": [-2.5, -0.5, 0.5, 2.5]})
+    encoded = bundle.space.build(frame, bundle.woe)
+    margin = bundle.predictor.margin(encoded)
+    scored = bundle.score(frame, include_decisions=False)
+
+    expected = np.round(credit_score_from_log_odds(margin, bundle.scorecard_settings), 1)
+    np.testing.assert_allclose(scored["credit_score"].to_numpy(), expected)
+    # every distinct margin keeps a distinct score
+    assert scored["credit_score"].nunique() == len(np.unique(np.round(margin, 9)))
+
+
+def test_a_scorecard_reconciles_even_at_an_extreme_base_rate(applications, settings):
+    """This is what surfaced the saturation: a 0.4% bad rate blew the check by 566 points."""
+    from riskflow.data.schema import infer_schema
+    from riskflow.features.woe import WoeTransformer
+    from riskflow.models.scorecard import ScorecardSettings, build_scorecard, verify_scorecard
+    from riskflow.models.training import _fit_logistic
+    from riskflow.features.space import woe_space
+    from riskflow.settings import ModelSettings
+
+    rng = np.random.default_rng(9)
+    frame = applications.copy()
+    rare = (frame[LABEL] == 1) & (rng.random(len(frame)) < 0.05)
+    frame.loc[(frame[LABEL] == 1) & ~rare, LABEL] = 0
+
+    schema = infer_schema(frame, LABEL, time_col="apply_time", id_col="application_id")
+    woe = WoeTransformer.fit(frame, schema, settings.binning)
+    features = tuple(woe.features)[:5]
+    encoded = woe_space(features).build(frame, woe)
+    scorer = _fit_logistic(encoded, frame[LABEL].to_numpy(float), {"C": 1.0}, ModelSettings())
+
+    card = build_scorecard(scorer, woe.subset(features), ScorecardSettings())
+    assert verify_scorecard(card, scorer, woe.subset(features), frame, ScorecardSettings()) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Dirty inputs that real feeds actually produce
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_column_names_are_named_rather_than_producing_a_pandas_riddle():
+    """Joins produce these constantly; `df[col]` then returns a frame, not a series."""
+    from riskflow.data.schema import infer_schema, validate_frame
+
+    frame = pd.DataFrame([[1, 2, 3, 0]], columns=["age", "age", "income", LABEL])
+    with pytest.raises(ValueError, match="duplicate column name"):
+        infer_schema(frame, LABEL)
+
+
+@pytest.mark.parametrize(
+    "values,expected",
+    [(["0", "1", "0"], [0.0, 1.0, 0.0]), ([True, False, True], [1.0, 0.0, 1.0]), ([0, 1, 0], [0, 1, 0])],
+)
+def test_a_label_that_survived_a_csv_round_trip_is_coerced(values, expected):
+    from riskflow.data.schema import coerce_label
+
+    frame = pd.DataFrame({LABEL: values})
+    assert coerce_label(frame, LABEL)[LABEL].tolist() == expected
+
+
+def test_an_uncoercible_label_names_the_offending_values():
+    from riskflow.data.schema import coerce_label
+
+    with pytest.raises(ValueError, match="good"):
+        coerce_label(pd.DataFrame({LABEL: ["good", "bad"]}), LABEL)
+
+
+# ---------------------------------------------------------------------------
+# Operational stability
+# ---------------------------------------------------------------------------
+
+
+def test_auto_generated_run_names_do_not_collide_within_one_second(tmp_path):
+    """The default name has one-second resolution; parallel training must still work."""
+    registry = Registry(tmp_path / "runs")
+    names = {registry.new_run().name for _ in range(5)}
+    assert len(names) == 5
+
+
+def test_an_explicit_run_name_still_refuses_to_reuse_a_directory(tmp_path):
+    registry = Registry(tmp_path / "runs")
+    registry.new_run("mine")
+    with pytest.raises(FileExistsError):
+        registry.new_run("mine")
+
+
+def test_a_failing_figure_builder_does_not_leak_figures(tmp_path, minimal_bundle):
+    """matplotlib keeps a global registry; leaked figures accumulate for the process."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from riskflow.reporting import plots
+
+    registry = Registry(tmp_path / "runs")
+    run = registry.new_run("figures")
+    minimal_bundle.save(run.bundle_path)
+    run.summary_path.write_text("{}", encoding="utf-8")
+
+    def exploding(_run, pyplot):
+        pyplot.subplots()          # a figure exists before the failure
+        raise RuntimeError("boom")
+
+    plt.close("all")
+    original = plots._gains_plot
+    plots._gains_plot = exploding
+    try:
+        for _ in range(20):
+            plots.make_figures(run, 80)
+        assert plt.get_fignums() == []
+    finally:
+        plots._gains_plot = original
+        plt.close("all")
+
+
+# ---------------------------------------------------------------------------
+# A gate that measurement rejected
+# ---------------------------------------------------------------------------
+
+
+def test_information_value_significance_is_reported_but_not_enforced(applications, schema, settings):
+    """Screening reports how marginal a feature is; it does not act on it.
+
+    A false-discovery-rate gate was built here and then removed: measured against
+    a 300-column noise injection it dropped holdout AUC from 0.735 to 0.670,
+    because the multiplicity correction strips real features as the candidate set
+    grows. The diagnostic is worth surfacing; the automatic pruning was not.
+    """
+    from riskflow.features.diagnostics import benjamini_hochberg, iv_p_value, screen
+    from riskflow.features.woe import WoeTransformer
+    from riskflow.data.splitting import split
+
+    assert settings.screening.iv_significance_alpha == 0.0
+
+    parts = split(applications, LABEL, settings.split)
+    woe = WoeTransformer.fit(parts.train, schema, settings.binning)
+    result = screen(parts.train, parts.test, schema, woe, settings.screening)
+
+    assert {"iv_holdout", "iv_p_value"} <= set(result.report.columns)
+    assert not result.report["reason"].str.contains("noise produces").any()
+
+    # a strong driver is significant, a planted noise column is not
+    p_values = dict(zip(result.report["feature"], result.report["iv_p_value"]))
+    assert p_values["max_delinquency"] < 0.01
+    assert (p_values.get("noise_score") is None) or (p_values["noise_score"] > 0.05)
+
+
+def test_the_significance_test_recognises_signal_and_noise():
+    from riskflow.features.diagnostics import benjamini_hochberg, iv_p_value
+
+    # 1000 rows, 200 bads, 5 bins: a large IV is significant, a tiny one is not
+    assert iv_p_value(0.60, 1000, 200, 5) < 1e-6
+    assert iv_p_value(0.01, 1000, 200, 5) > 0.10
+    assert np.isnan(iv_p_value(0.5, 1000, 0, 5)), "no bads means no test"
+
+    survivors = benjamini_hochberg({"real": 1e-9, "weak": 0.2, "noise": 0.9}, alpha=0.05)
+    assert survivors == {"real"}
+    # with the gate disabled nothing is condemned
+    assert benjamini_hochberg({"a": 0.9}, alpha=0.0) == {"a"}

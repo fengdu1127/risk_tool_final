@@ -21,15 +21,31 @@ def scale_factors(settings: ScorecardSettings) -> tuple[float, float]:
     return float(factor), float(offset)
 
 
-def to_credit_score(probability, settings: ScorecardSettings) -> np.ndarray:
-    """Map bad probability onto the credit-score scale — higher is safer.
+def credit_score_from_log_odds(log_odds, settings: ScorecardSettings) -> np.ndarray:
+    """Map log-odds of going bad onto the credit-score scale — higher is safer.
 
-    The score equals `base_score` exactly when the odds of going bad equal
-    `base_odds`, and every `pdo` points doubles the good-to-bad odds.
+    This is the definition. The score equals `base_score` exactly when the odds
+    of going bad equal `base_odds`, and every `pdo` points doubles the
+    good-to-bad odds.
     """
     factor, offset = scale_factors(settings)
+    margin = np.asarray(pd.Series(log_odds).to_numpy(), dtype=float)
+    return offset - factor * margin
+
+
+def to_credit_score(probability, settings: ScorecardSettings) -> np.ndarray:
+    """Credit score from a bad probability.
+
+    Prefer `credit_score_from_log_odds` wherever the model's margin is available.
+    A probability loses the information this scale needs at the extremes: past a
+    log-odds of about 36 the sigmoid saturates to exactly 1.0 in float64, so
+    every applicant beyond that point maps to the same score no matter how much
+    riskier they get — collapsing the ordering precisely in the tail that
+    matters most. The clip below keeps the arithmetic finite; it cannot recover
+    the lost resolution.
+    """
     p = np.clip(np.asarray(pd.Series(probability).to_numpy(), dtype=float), 1e-9, 1 - 1e-9)
-    return offset - factor * np.log(p / (1.0 - p))
+    return credit_score_from_log_odds(np.log(p / (1.0 - p)), settings)
 
 
 def build_scorecard(
@@ -88,7 +104,10 @@ def verify_scorecard(
     from ..features.space import woe_space
 
     encoded = woe_space(scorer.features).build(df, woe)
-    model_score = to_credit_score(scorer.predict_proba(encoded), settings)
+    # Compared against the margin, not the probability: the card sums log-odds,
+    # so round-tripping through a saturating sigmoid would manufacture a
+    # disagreement that does not exist.
+    model_score = credit_score_from_log_odds(scorer.margin(encoded), settings)
 
     lookup = {
         (row["feature"], row["bin"]): row["points"]

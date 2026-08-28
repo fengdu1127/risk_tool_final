@@ -13,6 +13,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from .bundle import BUNDLE_FILENAME, ScoringBundle
 from .logging_setup import get_logger
@@ -98,10 +99,27 @@ class Registry:
         # run somewhere `list_runs` and the production pointer cannot see it.
         if run_name != Path(run_name).name or run_name in {"", ".", ".."} or run_name == POINTER_FILENAME:
             raise ValueError(f"invalid run name '{run_name}'; it must be a single directory name")
+
+        self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / run_name
-        if path.exists():
-            raise FileExistsError(f"run directory already exists: {path}")
-        path.mkdir(parents=True)
+        if name is None:
+            # The default name has one-second resolution, so training several
+            # configurations in parallel would collide. An explicit name still
+            # fails loudly — that collision means the caller lost track of a run.
+            suffix = 1
+            while True:
+                try:
+                    path.mkdir()
+                    break
+                except FileExistsError:
+                    suffix += 1
+                    run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{suffix}"
+                    path = self.root / run_name
+        else:
+            try:
+                path.mkdir()
+            except FileExistsError as exc:
+                raise FileExistsError(f"run directory already exists: {path}") from exc
         (path / TABLES_DIR).mkdir()
         (path / FIGURES_DIR).mkdir()
         return Run(path=path)
@@ -133,7 +151,11 @@ class Registry:
         # a concurrent promotion leaves the pointer naming either the old run or
         # the new one — never a truncated name, and never nothing at all while
         # scoring is asking who production is.
-        staging = self.pointer_path.with_name(f".{POINTER_FILENAME}.{os.getpid()}")
+        #
+        # The staging name carries a random token, not just the pid: two threads
+        # of one process would otherwise share the path, and the second would
+        # find its file already renamed out from under it.
+        staging = self.pointer_path.with_name(f".{POINTER_FILENAME}.{os.getpid()}.{uuid4().hex[:8]}")
         try:
             staging.write_text(resolved.name + "\n", encoding="utf-8")
             os.replace(staging, self.pointer_path)

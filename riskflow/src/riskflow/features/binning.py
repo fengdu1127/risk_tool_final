@@ -490,6 +490,27 @@ def _interval_labels(cuts: Sequence[float]) -> list[str]:
     return labels
 
 
+def iv_for_bins(bin_index: np.ndarray, y) -> float:
+    """Information value of an existing bin assignment on a fresh sample.
+
+    Recomputed from counts rather than reusing the fitted WOE, so this measures
+    how much the *bins* separate risk in data they were not chosen on.
+    """
+    target = pd.Series(y).reset_index(drop=True).astype(float).to_numpy()
+    bins = np.asarray(bin_index)
+    if len(bins) != len(target) or len(target) == 0:
+        return float("nan")
+    keep = ~np.isnan(target)
+    bins, target = bins[keep], target[keep]
+    if len(target) == 0 or len(np.unique(target)) < 2:
+        return float("nan")
+    levels = np.unique(bins)
+    counts = np.array([float((bins == level).sum()) for level in levels])
+    bads = np.array([float(target[bins == level].sum()) for level in levels])
+    _, iv = _woe_from_counts(counts, bads)
+    return float(iv.sum())
+
+
 def bin_table(binnings: Iterable[Binning]) -> pd.DataFrame:
     """Flatten fitted binnings into one reportable table."""
     rows = []

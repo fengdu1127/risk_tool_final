@@ -26,8 +26,8 @@ from .data.schema import DatasetSchema, validate_frame
 from .features.space import FeatureSpace
 from .features.woe import WoeTransformer
 from .logging_setup import get_logger
-from .models.predictors import IsotonicCurve, Predictor, predictor_from_dict
-from .models.scorecard import to_credit_score
+from .models.predictors import IsotonicCurve, Predictor, _sigmoid, predictor_from_dict
+from .models.scorecard import credit_score_from_log_odds
 from .monitoring.drift import DriftBaseline
 from .policy.decision import DecisionPolicy
 from .settings import ScorecardSettings
@@ -65,13 +65,19 @@ class ScoringBundle:
         for message in warnings:
             log.warning("input check: %s", message)
 
-        raw = self.raw_scores(df)
+        features = self.space.build(df, self.woe)
+        margin = self.predictor.margin(features)
+        raw = _sigmoid(margin)
+
         out = pd.DataFrame(index=df.index)
         if self.schema.id_col and self.schema.id_col in df.columns:
             out[self.schema.id_col] = df[self.schema.id_col].to_numpy()
         out["model_score"] = raw
         out["calibrated_prob"] = self.calibrator.predict(raw) if self.calibrator else raw
-        out["credit_score"] = np.round(to_credit_score(raw, self.scorecard_settings), 1)
+        # From the margin, not from `raw`: the probability saturates at extreme
+        # log-odds, which would flatten the credit score exactly across the
+        # riskiest applicants and break the ordering the score exists to provide.
+        out["credit_score"] = np.round(credit_score_from_log_odds(margin, self.scorecard_settings), 1)
         if include_decisions:
             out = pd.concat([out, self.policy.decide(df, raw)], axis=1)
         return out

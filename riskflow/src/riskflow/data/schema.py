@@ -74,6 +74,7 @@ def infer_schema(
     Booleans are treated as numeric; anything else non-numeric is categorical.
     The label, time and id columns are never features.
     """
+    _reject_duplicate_columns(df)
     if label not in df.columns:
         raise ValueError(f"label column '{label}' not in data; columns are {list(df.columns)}")
     for name, col in (("time_col", time_col), ("id_col", id_col)):
@@ -114,6 +115,42 @@ def infer_schema(
     )
 
 
+def _reject_duplicate_columns(df: pd.DataFrame) -> None:
+    """Duplicate column names make `df[col]` return a frame, not a series.
+
+    Joins produce these routinely, and every downstream operation then fails
+    somewhere deep with an unrelated-looking pandas error about the truth value
+    of a Series.
+    """
+    duplicated = sorted({str(c) for c in df.columns[df.columns.duplicated()]})
+    if duplicated:
+        raise ValueError(f"duplicate column name(s) in the data: {duplicated}")
+
+
+def coerce_label(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Return a frame whose label column is numeric 0/1.
+
+    CSV round trips routinely turn a label into the strings "0" and "1", and
+    booleans are just as common. Both are unambiguous, so they are converted
+    rather than rejected; anything else is refused by name.
+    """
+    if label not in df.columns:
+        raise ValueError(f"label column '{label}' not in data")
+    column = df[label]
+    if pd.api.types.is_bool_dtype(column):
+        return df.assign(**{label: column.astype(float)})
+    if pd.api.types.is_numeric_dtype(column):
+        return df
+    converted = pd.to_numeric(column, errors="coerce")
+    unconvertible = converted.isna() & column.notna()
+    if unconvertible.any():
+        offenders = sorted({str(v) for v in column[unconvertible].unique()})[:5]
+        raise ValueError(
+            f"label '{label}' holds non-numeric value(s) {offenders}; it must be 0/1"
+        )
+    return df.assign(**{label: converted.astype(float)})
+
+
 def validate_frame(df: pd.DataFrame, schema: DatasetSchema, *, require_label: bool = True) -> list[str]:
     """Check a frame against the schema.
 
@@ -121,6 +158,7 @@ def validate_frame(df: pd.DataFrame, schema: DatasetSchema, *, require_label: bo
     rest so the caller can log them.
     """
     warnings: list[str] = []
+    _reject_duplicate_columns(df)
     missing = [c for c in schema.features if c not in df.columns]
     if missing:
         raise ValueError(f"data is missing schema features: {missing}")

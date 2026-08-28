@@ -40,17 +40,22 @@ def make_figures(run, dpi: int = 120) -> list[Path]:
         ("cutoff_tradeoff", _cutoff_plot),
         ("woe_trends", _woe_plot),
     ):
+        # A builder that dies after creating its figure would otherwise leave it
+        # open forever: matplotlib holds a global registry, so in a long-lived
+        # process those accumulate until it starts warning about the count.
+        before = set(plt.get_fignums())
         try:
             figure = builder(run, plt)
+            if figure is None:
+                continue
+            path = run.figures / f"{name}.png"
+            figure.savefig(path, bbox_inches="tight")
+            written.append(path)
         except Exception as exc:
             log.debug("figure '%s' skipped: %s", name, exc)
-            continue
-        if figure is None:
-            continue
-        path = run.figures / f"{name}.png"
-        figure.savefig(path, bbox_inches="tight")
-        plt.close(figure)
-        written.append(path)
+        finally:
+            for number in set(plt.get_fignums()) - before:
+                plt.close(number)
     log.info("wrote %d figure(s)", len(written))
     return written
 

@@ -20,6 +20,14 @@ class Predictor(Protocol):
     kind: str
     features: tuple[str, ...]
 
+    def margin(self, X: pd.DataFrame) -> np.ndarray:
+        """Log-odds of the positive class.
+
+        Callers that need resolution in the tails must use this rather than
+        inverting `predict_proba`, whose sigmoid saturates.
+        """
+        ...
+
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray: ...
     def to_dict(self) -> dict: ...
 

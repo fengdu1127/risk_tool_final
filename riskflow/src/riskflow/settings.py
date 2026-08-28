@@ -56,6 +56,14 @@ class ScreeningSettings:
     # An implausibly high IV usually means label leakage, not a great feature.
     max_iv: float = 1.50
     max_psi: float = 0.10
+    # Optional false-discovery-rate gate on out-of-sample IV. Off by default,
+    # and deliberately so: measured against a 300-column noise injection it cost
+    # more than it saved, because the multiplicity correction strips real
+    # features as the candidate set grows — adding junk columns would silently
+    # remove good ones. The p-value is always reported so an analyst can see
+    # which features are marginal; enable this only with a large evaluation
+    # sample and a genuine need to prune automatically.
+    iv_significance_alpha: float = 0.0
     max_abs_corr: float = 0.70
     max_vif: float = 10.0
     min_monotonic_corr: float = 0.60
