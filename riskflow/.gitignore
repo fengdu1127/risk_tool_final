@@ -1,0 +1,10 @@
+runs/
+demo_data.csv
+scored*.csv
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
