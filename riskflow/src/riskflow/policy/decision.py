@@ -18,6 +18,22 @@ from .thresholds import Cutoff, SegmentCutoff
 
 APPROVE, REVIEW, REJECT = "approve", "review", "reject"
 
+# Scores are compared to thresholds at this many decimal places.
+#
+# A dot product is not bit-reproducible across batch sizes: BLAS picks a
+# different summation order for a one-row matrix than for a thousand-row one, so
+# the same applicant's score can differ in its last bit between a real-time call
+# and a batch reconciliation. Thresholds are empirical quantiles of training
+# scores — literally equal to observed values — so a row can sit exactly on one,
+# and measurement showed 26 decisions per 300 such thresholds flipping between
+# the two paths. Comparing at a fixed precision removes that: 1e-12 is far below
+# any meaningful resolution of a probability and far above the ~1e-16 noise.
+DECISION_PRECISION = 12
+
+
+def _at_decision_precision(values: np.ndarray) -> np.ndarray:
+    return np.round(np.asarray(values, dtype=float), DECISION_PRECISION)
+
 
 @dataclass(frozen=True)
 class DecisionPolicy:
@@ -84,6 +100,9 @@ class DecisionPolicy:
             )
 
         reject_at, review_at, segment = self.thresholds_for(df)
+        score = _at_decision_precision(score)
+        reject_at = _at_decision_precision(reject_at)
+        review_at = _at_decision_precision(review_at)
         rule_hit = first_hit_labels(self.reject_rules, df) if self.reject_rules else np.full(len(df), "", dtype=object)
         by_rule = rule_hit != ""
         by_score = score >= reject_at

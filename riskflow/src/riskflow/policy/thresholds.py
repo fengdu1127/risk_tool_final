@@ -34,9 +34,14 @@ class Cutoff:
     review_at: float
 
     def decide(self, scores: np.ndarray) -> np.ndarray:
+        # Same fixed precision the deployed policy uses, so a cutoff evaluated
+        # during training and applied in production agree row for row.
+        from .decision import DECISION_PRECISION
+
+        scores = np.round(np.asarray(scores, dtype=float), DECISION_PRECISION)
         decision = np.full(len(scores), "approve", dtype=object)
-        decision[scores >= self.review_at] = "review"
-        decision[scores >= self.reject_at] = "reject"
+        decision[scores >= round(self.review_at, DECISION_PRECISION)] = "review"
+        decision[scores >= round(self.reject_at, DECISION_PRECISION)] = "reject"
         return decision
 
     def to_dict(self) -> dict:

@@ -499,3 +499,83 @@ def test_the_significance_test_recognises_signal_and_noise():
     assert survivors == {"real"}
     # with the gate disabled nothing is condemned
     assert benjamini_hochberg({"a": 0.9}, alpha=0.0) == {"a"}
+
+
+# ---------------------------------------------------------------------------
+# The same applicant must get the same answer through any channel
+# ---------------------------------------------------------------------------
+
+
+def test_the_decision_boundary_is_immune_to_batch_size(minimal_bundle):
+    """A real-time call and a batch reconciliation must agree on the decision.
+
+    A dot product is not bit-reproducible across batch sizes — BLAS sums a
+    one-row matrix differently from a thousand-row one — and thresholds are
+    empirical quantiles, so they sit exactly on observed scores. Before the
+    comparison was fixed to a set precision, 26 decisions per 300 such
+    thresholds flipped depending on how the applicant happened to be scored.
+    """
+    rng = np.random.default_rng(11)
+    frame = pd.DataFrame({"x": rng.normal(size=400)})
+
+    batch = minimal_bundle.raw_scores(frame)
+    single = np.array([minimal_bundle.raw_scores(frame.iloc[[i]])[0] for i in range(len(frame))])
+    assert np.max(np.abs(batch - single)) < 1e-14
+
+    # thresholds placed exactly on observed scores: the adversarial case
+    flips = 0
+    for threshold in batch[:100]:
+        policy = DecisionPolicy(
+            global_cutoff=Cutoff(reject_at=float(threshold), review_at=float(threshold))
+        )
+        flips += int(
+            (policy.decide(frame, batch)["decision"].to_numpy()
+             != policy.decide(frame, single)["decision"].to_numpy()).sum()
+        )
+    assert flips == 0
+
+
+def test_a_score_a_hair_below_the_threshold_is_still_approved():
+    """The fixed precision must not smear the boundary any wider than intended."""
+    policy = DecisionPolicy(global_cutoff=Cutoff(reject_at=0.5, review_at=0.3))
+    decisions = policy.decide(
+        pd.DataFrame({"a": [0.0] * 4}),
+        [0.5 - 1e-9, 0.5 - 1e-16, 0.5, 0.5 + 1e-9],
+    )["decision"].tolist()
+    # a difference of 1e-9 is real and respected; 1e-16 is noise and is not
+    assert decisions == ["review", "reject", "reject", "reject"]
+
+
+def test_scoring_is_independent_of_row_order(minimal_bundle):
+    rng = np.random.default_rng(12)
+    frame = pd.DataFrame({"x": rng.normal(size=300)})
+    order = rng.permutation(len(frame))
+
+    straight = minimal_bundle.score(frame)
+    shuffled = minimal_bundle.score(frame.iloc[order].reset_index(drop=True))
+    restored = shuffled.iloc[np.argsort(order)].reset_index(drop=True)
+
+    np.testing.assert_array_equal(straight["credit_score"], restored["credit_score"])
+    assert (straight["decision"].to_numpy() == restored["decision"].to_numpy()).all()
+
+
+def test_a_post_outcome_feature_is_caught_before_it_reaches_the_model(applications, schema, settings):
+    """Leakage is the failure a risk model is least able to detect on its own."""
+    from riskflow.data.schema import infer_schema
+    from riskflow.data.splitting import split
+    from riskflow.features.diagnostics import screen
+    from riskflow.features.woe import WoeTransformer
+
+    rng = np.random.default_rng(13)
+    frame = applications.copy()
+    # a collections contact only ever happens after the account has gone bad
+    frame["collections_contacts"] = np.where(frame[LABEL] == 1, rng.integers(1, 6, len(frame)), 0)
+
+    leaky_schema = infer_schema(frame, LABEL, time_col="apply_time", id_col="application_id")
+    parts = split(frame, LABEL, settings.split)
+    woe = WoeTransformer.fit(parts.train, leaky_schema, settings.binning)
+    result = screen(parts.train, parts.test, leaky_schema, woe, settings.screening)
+
+    assert "collections_contacts" not in result.selected
+    reason = result.report.loc[result.report["feature"] == "collections_contacts", "reason"].iloc[0]
+    assert "leakage" in reason
